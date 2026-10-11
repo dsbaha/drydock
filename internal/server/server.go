@@ -5,6 +5,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -149,6 +150,8 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.Handle("GET /api/admin/wiki-proposals", authed(http.HandlerFunc(s.handleWikiProposals)))
 	mux.Handle("POST /api/admin/wiki-proposals/{id}/approve", authed(http.HandlerFunc(s.handleApproveWikiProposal)))
 	mux.Handle("POST /api/admin/wiki-proposals/{id}/reject", authed(http.HandlerFunc(s.handleRejectWikiProposal)))
+	mux.Handle("GET /api/admin/volumes/orphaned", authed(http.HandlerFunc(s.handleOrphanedVolumes)))
+	mux.Handle("POST /api/admin/volumes/prune", authed(http.HandlerFunc(s.handlePruneVolumes)))
 	mux.Handle("GET /api/admin/settings", authed(http.HandlerFunc(s.handleGetSettings)))
 	mux.Handle("PUT /api/admin/settings", authed(http.HandlerFunc(s.handleUpdateSettings)))
 	mux.Handle("GET /api/admin/providers", authed(http.HandlerFunc(s.handleProviders)))
@@ -989,6 +992,62 @@ func (s *Server) handleRejectWikiProposal(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ---------- admin: orphaned volumes ----------
+
+// handleOrphanedVolumes lists Drydock-managed volumes safe to delete: their
+// card row is gone or their card is done. Volumes for cards in any other
+// column are never listed. When Docker is unreachable the response carries
+// {"unavailable": true} instead of an error (admin only).
+func (s *Server) handleOrphanedVolumes(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	if s.Orch.Docker == nil {
+		writeJSON(w, http.StatusOK, map[string]bool{"unavailable": true})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	vols, err := s.Orch.OrphanedVolumes(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]bool{"unavailable": true})
+		return
+	}
+	if vols == nil {
+		vols = []agents.OrphanedVolume{}
+	}
+	writeJSON(w, http.StatusOK, vols)
+}
+
+// handlePruneVolumes deletes exactly the named volumes, re-verifying at
+// prune time that each is still orphaned (a done card reopened between scan
+// and prune gets a fresh volume under the same name — deleting it would nuke
+// live data). Best-effort per volume; one failure never aborts the rest
+// (admin only).
+func (s *Server) handlePruneVolumes(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	var req struct {
+		Volumes []string `json:"volumes"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if len(req.Volumes) == 0 {
+		writeErr(w, http.StatusBadRequest, "no volumes specified")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	results := s.Orch.PruneVolumes(ctx, req.Volumes)
+	if results == nil {
+		results = []agents.PruneResult{}
+	}
+	writeJSON(w, http.StatusOK, results)
 }
 
 // ---------- global settings ----------

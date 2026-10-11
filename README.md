@@ -89,7 +89,8 @@ Admin: `GET/POST/DELETE /api/admin/feeds`, `PUT /api/admin/feeds/:id`,
 `GET /api/admin/rejected`, `POST /api/admin/rejected/:id/accept`,
 `GET/POST/DELETE /api/admin/providers`,
 `GET /api/admin/wiki-proposals?status=`, `POST /api/admin/wiki-proposals/:id/approve|reject`,
-`GET/PUT /api/admin/settings`
+`GET/PUT /api/admin/settings`,
+`GET /api/admin/volumes/orphaned`, `POST /api/admin/volumes/prune`
 Live: `GET /api/stream` (board events), `GET /api/cards/:id/chat` (per-card chat)
 
 ## Design decisions
@@ -117,6 +118,15 @@ Live: `GET /api/stream` (board events), `GET /api/cards/:id/chat` (per-card chat
   messages all live on the card; the agent resumes in context.
 - **Webhooks sit behind auth** in this build (no per-source secrets yet) —
   call through the same reverse proxy that enforces auth.
+- **No orphaned volumes.** A card's volume never outlives its container:
+  reaching done (or the manual remove button) deletes both, after archiving
+  a full markdown transcript onto the card in the database. Volumes orphaned
+  *before* that policy existed (card gone, or card done) can be found and
+  deleted from Admin → Volumes — the scan only ever lists volumes whose
+  card is gone or done, and prune re-verifies orphan status at delete time
+  (a done card reopened between scan and prune gets a fresh volume under the
+  same name, which must not be touched) and deletes exactly the checked
+  names, best-effort per volume.
 - **Single static binary**, `go:embed` UI, SQLite (WAL), no CGO — same
   deployment story as TermDock.
 - **Instructions layer.** Global working instructions plus per-board

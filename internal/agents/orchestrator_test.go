@@ -491,6 +491,7 @@ type fakeDocker struct {
 	mu      sync.Mutex
 	stopped []string
 	volumes []string
+	managed []dockerx.ManagedVolume
 }
 
 func (f *fakeDocker) StopAndRemove(ctx context.Context, containerID string) error {
@@ -505,6 +506,14 @@ func (f *fakeDocker) RemoveVolume(ctx context.Context, name string) error {
 	defer f.mu.Unlock()
 	f.volumes = append(f.volumes, name)
 	return nil
+}
+
+func (f *fakeDocker) ListManagedVolumes(ctx context.Context) ([]dockerx.ManagedVolume, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]dockerx.ManagedVolume, len(f.managed))
+	copy(out, f.managed)
+	return out, nil
 }
 
 func (f *fakeDocker) FindCardContainer(ctx context.Context, cardID string) (string, bool, error) {
@@ -663,5 +672,126 @@ func TestReopenAfterDone(t *testing.T) {
 		if !s.Done {
 			t.Fatalf("step %q not done after reopen", s.Label)
 		}
+	}
+}
+
+// orphanTestCard creates a card row directly (no worker run) in the given column.
+func orphanTestCard(t *testing.T, database *db.DB, boardID, title, column string) string {
+	t.Helper()
+	now := db.Now()
+	c := &model.Card{
+		ID: db.NewID(), BoardID: boardID, Title: title, Body: "", Source: "test",
+		Column: column, AgentRuntime: "echo", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := database.CreateCard(c); err != nil {
+		t.Fatal(err)
+	}
+	return c.ID
+}
+
+// TestOrphanedVolumes: only volumes for done cards or missing card rows are
+// listed; volumes for cards in other columns are never listed.
+func TestOrphanedVolumes(t *testing.T) {
+	o, database := testOrchestrator(t)
+	board, err := database.EnsureDefaultBoard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneID := orphanTestCard(t, database, board.ID, "Done task", model.ColDone)
+	workingID := orphanTestCard(t, database, board.ID, "Working task", model.ColWorking)
+	missingID := db.NewID()
+	fake := &fakeDocker{managed: []dockerx.ManagedVolume{
+		{Name: "drydock-card-done1", CardID: doneID, CreatedAt: time.Now().Add(-2 * time.Hour)},
+		{Name: "drydock-card-work1", CardID: workingID},
+		{Name: "drydock-card-miss1", CardID: missingID},
+		{Name: "drydock-card-nolabel", CardID: ""},
+	}}
+	o.Docker = fake
+	vols, err := o.OrphanedVolumes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]OrphanedVolume{}
+	for _, v := range vols {
+		got[v.Name] = v
+	}
+	for _, want := range []string{"drydock-card-done1", "drydock-card-miss1", "drydock-card-nolabel"} {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("expected %s to be listed as orphaned", want)
+		}
+	}
+	if _, ok := got["drydock-card-work1"]; ok {
+		t.Fatal("working card's volume must never be listed as orphaned")
+	}
+	if got["drydock-card-done1"].CardTitle != "Done task" {
+		t.Fatalf("done volume CardTitle = %q, want %q", got["drydock-card-done1"].CardTitle, "Done task")
+	}
+	if got["drydock-card-done1"].CreatedAt.IsZero() {
+		t.Fatal("done volume CreatedAt not carried through")
+	}
+}
+
+// TestOrphanedVolumesNoDocker: nil Docker client returns (nil, nil).
+func TestOrphanedVolumesNoDocker(t *testing.T) {
+	o, _ := testOrchestrator(t)
+	vols, err := o.OrphanedVolumes(context.Background())
+	if err != nil || vols != nil {
+		t.Fatalf("want (nil, nil) without Docker, got (%v, %v)", vols, err)
+	}
+}
+
+// TestPruneVolumes: deletes exactly the requested orphaned volumes;
+// non-orphaned names are skipped, and a volume that stopped being orphaned
+// between scan and prune (done card reopened) is skipped too.
+func TestPruneVolumes(t *testing.T) {
+	o, database := testOrchestrator(t)
+	board, err := database.EnsureDefaultBoard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneID := orphanTestCard(t, database, board.ID, "Done task", model.ColDone)
+	reopenedID := orphanTestCard(t, database, board.ID, "Reopened task", model.ColDone)
+	workingID := orphanTestCard(t, database, board.ID, "Working task", model.ColWorking)
+	fake := &fakeDocker{managed: []dockerx.ManagedVolume{
+		{Name: "drydock-card-a", CardID: doneID},
+		{Name: "drydock-card-b", CardID: reopenedID},
+		{Name: "drydock-card-c", CardID: workingID},
+	}}
+	o.Docker = fake
+	// Reopen the done card after the scan list is built: prune re-verifies.
+	if err := database.SetCardColumn(reopenedID, model.ColWorking); err != nil {
+		t.Fatal(err)
+	}
+	results := o.PruneVolumes(context.Background(), []string{
+		"drydock-card-a", "drydock-card-b", "drydock-card-c", "drydock-card-ghost",
+	})
+	byName := map[string]PruneResult{}
+	for _, r := range results {
+		byName[r.Name] = r
+	}
+	if !byName["drydock-card-a"].OK {
+		t.Fatalf("done volume prune failed: %+v", byName["drydock-card-a"])
+	}
+	for _, n := range []string{"drydock-card-b", "drydock-card-c", "drydock-card-ghost"} {
+		if byName[n].OK {
+			t.Fatalf("%s must not be pruned (ok=true)", n)
+		}
+		if byName[n].Error == "" {
+			t.Fatalf("%s skipped without an error message", n)
+		}
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.volumes) != 1 || fake.volumes[0] != "drydock-card-a" {
+		t.Fatalf("RemoveVolume called with %v, want only [drydock-card-a]", fake.volumes)
+	}
+}
+
+// TestPruneVolumesNoDocker: every name fails gracefully without Docker.
+func TestPruneVolumesNoDocker(t *testing.T) {
+	o, _ := testOrchestrator(t)
+	results := o.PruneVolumes(context.Background(), []string{"drydock-card-x"})
+	if len(results) != 1 || results[0].OK || results[0].Error == "" {
+		t.Fatalf("want graceful failure, got %+v", results)
 	}
 }

@@ -285,6 +285,40 @@ func (c *Client) RemoveVolume(ctx context.Context, name string) error {
 	return nil
 }
 
+// ManagedVolume is a Drydock-managed Docker volume (label drydock.managed).
+type ManagedVolume struct {
+	Name      string
+	CardID    string
+	CreatedAt time.Time
+}
+
+// ListManagedVolumes returns all volumes carrying the drydock.managed label.
+func (c *Client) ListManagedVolumes(ctx context.Context) ([]ManagedVolume, error) {
+	resp, err := c.cli.VolumeList(ctx, volume.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("label", LabelManaged+"=true")),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list volumes: %w", err)
+	}
+	out := make([]ManagedVolume, 0, len(resp.Volumes))
+	for _, v := range resp.Volumes {
+		if v == nil {
+			continue
+		}
+		mv := ManagedVolume{Name: v.Name}
+		if v.Labels != nil {
+			mv.CardID = v.Labels[LabelCard]
+		}
+		if v.CreatedAt != "" {
+			if ts, err := time.Parse(time.RFC3339Nano, v.CreatedAt); err == nil {
+				mv.CreatedAt = ts
+			}
+		}
+		out = append(out, mv)
+	}
+	return out, nil
+}
+
 // FindCardContainer returns the container ID and running state for the
 // container labeled with the given card ID, or "" if none exists.
 func (c *Client) FindCardContainer(ctx context.Context, cardID string) (string, bool, error) {

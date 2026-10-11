@@ -30,6 +30,7 @@ type Notifier interface {
 type dockerClient interface {
 	StopAndRemove(ctx context.Context, containerID string) error
 	RemoveVolume(ctx context.Context, name string) error
+	ListManagedVolumes(ctx context.Context) ([]dockerx.ManagedVolume, error)
 	FindCardContainer(ctx context.Context, cardID string) (string, bool, error)
 	ImageExists(ctx context.Context, ref string) bool
 	PullImage(ctx context.Context, ref string) error
@@ -444,6 +445,94 @@ func (o *Orchestrator) teardownCard(cardID string) string {
 	}
 	_ = o.DB.SetCardContainer(cardID, "")
 	return detail
+}
+
+// OrphanedVolume is a Drydock-managed volume that is safe to delete: its
+// card row is gone, or its card is done (done cards never keep volumes under
+// current policy). Volumes for cards in any other column are never listed.
+type OrphanedVolume struct {
+	Name      string    `json:"name"`
+	CardID    string    `json:"card_id"`
+	CardTitle string    `json:"card_title,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// OrphanedVolumes scans Docker for managed volumes that are safe to delete.
+// It returns (nil, nil) when no Docker runtime is reachable.
+func (o *Orchestrator) OrphanedVolumes(ctx context.Context) ([]OrphanedVolume, error) {
+	if o.Docker == nil {
+		return nil, nil
+	}
+	vols, err := o.Docker.ListManagedVolumes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []OrphanedVolume{}
+	for _, v := range vols {
+		card, err := o.DB.GetCard(v.CardID)
+		if err != nil {
+			log.Printf("drydock: orphan scan: get card %s: %v", v.CardID, err)
+			continue
+		}
+		if card == nil {
+			out = append(out, OrphanedVolume{Name: v.Name, CardID: v.CardID, CreatedAt: v.CreatedAt})
+			continue
+		}
+		if card.Column == model.ColDone {
+			out = append(out, OrphanedVolume{Name: v.Name, CardID: v.CardID, CardTitle: card.Title, CreatedAt: v.CreatedAt})
+		}
+	}
+	return out, nil
+}
+
+// PruneResult is the per-volume outcome of a prune request.
+type PruneResult struct {
+	Name  string `json:"name"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// PruneVolumes deletes exactly the named volumes — but only volumes that
+// still qualify as orphaned at prune time, guarding against races (e.g. a
+// done card reopened between scan and prune, which provisions a fresh volume
+// under the same deterministic name). Best-effort per volume: one failure
+// never aborts the rest.
+func (o *Orchestrator) PruneVolumes(ctx context.Context, names []string) []PruneResult {
+	results := make([]PruneResult, 0, len(names))
+	if o.Docker == nil {
+		for _, n := range names {
+			results = append(results, PruneResult{Name: n, Error: "docker unreachable"})
+		}
+		return results
+	}
+	orphaned, err := o.OrphanedVolumes(ctx)
+	if err != nil {
+		for _, n := range names {
+			results = append(results, PruneResult{Name: n, Error: "scan failed: " + err.Error()})
+		}
+		return results
+	}
+	allowed := map[string]bool{}
+	for _, v := range orphaned {
+		allowed[v.Name] = true
+	}
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		if !allowed[n] {
+			results = append(results, PruneResult{Name: n, Error: "not orphaned (skipped)"})
+			continue
+		}
+		if err := o.Docker.RemoveVolume(ctx, n); err != nil {
+			log.Printf("drydock: prune volume %s: %v", n, err)
+			results = append(results, PruneResult{Name: n, Error: err.Error()})
+			continue
+		}
+		results = append(results, PruneResult{Name: n, OK: true})
+	}
+	return results
 }
 
 // MoveToDone transitions a card to done: archives a transcript snapshot,

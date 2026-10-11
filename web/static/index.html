@@ -125,6 +125,15 @@
         <div id="filter-fallback-hint" class="fallback-hint hidden"></div>
         <div id="rejected-list"></div>
       </section>
+      <section class="admin-section">
+        <h2>Volumes</h2>
+        <p class="muted">Find Drydock-managed Docker volumes left over from before volumes were deleted with their containers. Only volumes whose card is gone or done are ever listed — volumes for active cards are never touched.</p>
+        <div class="admin-row">
+          <button id="volumes-scan" class="btn small">Scan for orphaned volumes</button>
+        </div>
+        <div id="volumes-list"></div>
+        <p id="volumes-error" class="error hidden"></p>
+      </section>
     </div>
   </div>
 

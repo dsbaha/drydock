@@ -1254,6 +1254,113 @@ async function acceptRejected(id) {
   }
 }
 
+/* ---------------- orphaned volumes ----------------
+   Scan lists Drydock-managed volumes whose card is gone or done; prune
+   deletes exactly the checked names after a confirm. */
+
+async function scanVolumes() {
+  const err = $("volumes-error");
+  err.classList.add("hidden");
+  const btn = $("volumes-scan");
+  btn.disabled = true;
+  try {
+    const data = await api("/api/admin/volumes/orphaned");
+    renderOrphanedVolumes(data);
+  } catch (e) {
+    if (e.message !== "unauthorized") {
+      err.textContent = "Scan failed: " + e.message;
+      err.classList.remove("hidden");
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderOrphanedVolumes(data) {
+  const el = $("volumes-list");
+  el.innerHTML = "";
+  if (data && data.unavailable) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "Docker is not reachable from the server — nothing to scan.";
+    el.appendChild(p);
+    return;
+  }
+  const vols = Array.isArray(data) ? data : [];
+  const head = document.createElement("p");
+  head.className = "muted";
+  head.textContent = vols.length === 0
+    ? "No orphaned volumes found."
+    : vols.length + " orphaned volume" + (vols.length === 1 ? "" : "s") + " found.";
+  el.appendChild(head);
+  if (vols.length === 0) return;
+
+  const selAll = document.createElement("label");
+  selAll.className = "checkline";
+  const selAllCb = document.createElement("input");
+  selAllCb.type = "checkbox";
+  selAll.append(selAllCb, document.createTextNode(" Select all"));
+  el.appendChild(selAll);
+
+  const boxes = [];
+  for (const v of vols) {
+    const row = document.createElement("div");
+    row.className = "admin-row";
+    const main = document.createElement("div");
+    main.className = "admin-row-main";
+    const label = document.createElement("label");
+    label.className = "checkline";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = v.name;
+    boxes.push(cb);
+    const title = document.createElement("span");
+    title.className = "admin-row-title";
+    title.textContent = v.name;
+    label.append(cb, title);
+    const sub = document.createElement("div");
+    sub.className = "admin-row-sub";
+    const cardBit = v.card_title ? "done card \u201C" + v.card_title + "\u201D" : "card gone";
+    sub.textContent = cardBit + " \u00B7 " + timeAgo(v.created_at);
+    main.append(label, sub);
+    row.appendChild(main);
+    el.appendChild(row);
+  }
+  selAllCb.addEventListener("change", () => {
+    for (const cb of boxes) cb.checked = selAllCb.checked;
+  });
+
+  const del = document.createElement("button");
+  del.className = "btn small danger";
+  del.textContent = "Delete selected";
+  del.addEventListener("click", async () => {
+    const names = boxes.filter((cb) => cb.checked).map((cb) => cb.value);
+    if (names.length === 0) {
+      toast("Nothing selected.");
+      return;
+    }
+    if (!confirm("Delete " + names.length + " volume(s)? This cannot be undone.")) return;
+    del.disabled = true;
+    try {
+      const results = await api("/api/admin/volumes/prune", {
+        method: "POST",
+        body: JSON.stringify({ volumes: names }),
+      });
+      const ok = results.filter((r) => r.ok).length;
+      const failed = results.filter((r) => !r.ok);
+      toast("Deleted " + ok + " volume(s)" + (failed.length ? "; " + failed.length + " failed" : "") + ".");
+      for (const f of failed) {
+        if (f.error) toast(f.name + ": " + f.error);
+      }
+      scanVolumes();
+    } catch (e) {
+      if (e.message !== "unauthorized") toast("Prune failed: " + e.message);
+      del.disabled = false;
+    }
+  });
+  el.appendChild(del);
+}
+
 function renderProviders(providers) {
   const list = $("providers-list");
   list.innerHTML = "";
@@ -1819,6 +1926,7 @@ function init() {
   $("feed-form").addEventListener("submit", submitFeed);
   $("provider-form").addEventListener("submit", submitProvider);
   $("webhook-copy").addEventListener("click", copyWebhookUrl);
+  $("volumes-scan").addEventListener("click", scanVolumes);
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       closeCardModal();
