@@ -131,7 +131,7 @@ func scanCard(row interface {
 	c := &model.Card{}
 	var openQ int
 	err := row.Scan(&c.ID, &c.BoardID, &c.Title, &c.Body, &c.Source, &c.Column,
-		&c.ProgressPct, &c.ContainerID, &c.AgentRuntime, &openQ, &c.CreatedAt, &c.UpdatedAt)
+		&c.ProgressPct, &c.ContainerID, &c.AgentRuntime, &c.WaitReason, &openQ, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -140,14 +140,14 @@ func scanCard(row interface {
 }
 
 const cardCols = `id, board_id, title, body, source, column_name, progress_pct,
-	container_id, agent_runtime, has_open_question, created_at, updated_at`
+	container_id, agent_runtime, wait_reason, has_open_question, created_at, updated_at`
 
 func (d *DB) CreateCard(c *model.Card) error {
 	_, err := d.Exec(`INSERT INTO cards (id, board_id, title, body, source, column_name,
-		progress_pct, container_id, agent_runtime, has_open_question, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		progress_pct, container_id, agent_runtime, wait_reason, has_open_question, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.BoardID, c.Title, c.Body, c.Source, c.Column, c.ProgressPct,
-		c.ContainerID, c.AgentRuntime, boolInt(c.HasOpenQuestion), c.CreatedAt, c.UpdatedAt)
+		c.ContainerID, c.AgentRuntime, c.WaitReason, boolInt(c.HasOpenQuestion), c.CreatedAt, c.UpdatedAt)
 	return err
 }
 
@@ -236,6 +236,14 @@ func (d *DB) SetCardContainer(id, containerID string) error {
 func (d *DB) SetCardOpenQuestion(id string, open bool) error {
 	_, err := d.Exec(`UPDATE cards SET has_open_question = ?, updated_at = ? WHERE id = ?`,
 		boolInt(open), Now(), id)
+	return err
+}
+
+// SetCardWaitReason records why a card sits in the waiting column. Callers
+// clear it (empty string) when the card leaves waiting.
+func (d *DB) SetCardWaitReason(id, reason string) error {
+	_, err := d.Exec(`UPDATE cards SET wait_reason = ?, updated_at = ? WHERE id = ?`,
+		reason, Now(), id)
 	return err
 }
 
@@ -426,7 +434,7 @@ func (d *DB) CreateFeed(f *model.Feed) error {
 }
 
 func (d *DB) ListFeeds() ([]*model.Feed, error) {
-	rows, err := d.Query(`SELECT id, name, url, board_id, interval_sec, last_polled_at, created_at
+	rows, err := d.Query(`SELECT id, name, url, board_id, interval_sec, last_polled_at, last_item_at, created_at
 		FROM feeds ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -435,7 +443,7 @@ func (d *DB) ListFeeds() ([]*model.Feed, error) {
 	var out []*model.Feed
 	for rows.Next() {
 		f := &model.Feed{}
-		if err := rows.Scan(&f.ID, &f.Name, &f.URL, &f.BoardID, &f.IntervalSec, &f.LastPolledAt, &f.CreatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.Name, &f.URL, &f.BoardID, &f.IntervalSec, &f.LastPolledAt, &f.LastItemAt, &f.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, f)
@@ -445,9 +453,9 @@ func (d *DB) ListFeeds() ([]*model.Feed, error) {
 
 func (d *DB) GetFeed(id string) (*model.Feed, error) {
 	f := &model.Feed{}
-	err := d.QueryRow(`SELECT id, name, url, board_id, interval_sec, last_polled_at, created_at
+	err := d.QueryRow(`SELECT id, name, url, board_id, interval_sec, last_polled_at, last_item_at, created_at
 		FROM feeds WHERE id = ?`, id).
-		Scan(&f.ID, &f.Name, &f.URL, &f.BoardID, &f.IntervalSec, &f.LastPolledAt, &f.CreatedAt)
+		Scan(&f.ID, &f.Name, &f.URL, &f.BoardID, &f.IntervalSec, &f.LastPolledAt, &f.LastItemAt, &f.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -462,6 +470,32 @@ func (d *DB) DeleteFeed(id string) error {
 func (d *DB) TouchFeed(id string, at int64) error {
 	_, err := d.Exec(`UPDATE feeds SET last_polled_at = ? WHERE id = ?`, at, id)
 	return err
+}
+
+// SetFeedLastItem records when a feed last produced a card.
+func (d *DB) SetFeedLastItem(id string, at int64) error {
+	_, err := d.Exec(`UPDATE feeds SET last_item_at = ? WHERE id = ?`, at, id)
+	return err
+}
+
+// WebhookSources lists the distinct webhook :source names seen in cards,
+// with their card counts, for the admin UI.
+func (d *DB) WebhookSources() ([]*model.WebhookSource, error) {
+	rows, err := d.Query(`SELECT source, COUNT(*) FROM cards
+		WHERE source LIKE 'webhook:%' GROUP BY source ORDER BY COUNT(*) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.WebhookSource
+	for rows.Next() {
+		ws := &model.WebhookSource{}
+		if err := rows.Scan(&ws.Source, &ws.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, ws)
+	}
+	return out, rows.Err()
 }
 
 func (d *DB) FeedSeenGUID(feedID, guid string) (bool, error) {

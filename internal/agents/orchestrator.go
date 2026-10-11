@@ -247,8 +247,12 @@ func (o *Orchestrator) SendBack(cardID, note, from string) error {
 	return nil
 }
 
-// MoveCard is the manual column move (review accept, triage, …).
-func (o *Orchestrator) MoveCard(cardID, column string) (*model.Card, error) {
+// MoveCard is the manual column move (review accept, triage, waiting, …).
+// Moving to waiting parks the card with an optional reason and pauses the
+// worker (the run is stopped); the reason is cleared when the card leaves
+// waiting. Moving back to working restarts the worker from the remaining
+// steps.
+func (o *Orchestrator) MoveCard(cardID, column, reason string) (*model.Card, error) {
 	if !model.ValidColumn(column) {
 		return nil, fmt.Errorf("unknown column %q", column)
 	}
@@ -258,6 +262,11 @@ func (o *Orchestrator) MoveCard(cardID, column string) (*model.Card, error) {
 	}
 	o.stopRun(cardID)
 	_ = o.DB.SetCardColumn(cardID, column)
+	if column == model.ColWaiting {
+		_ = o.DB.SetCardWaitReason(cardID, reason)
+	} else if card.Column == model.ColWaiting || reason != "" {
+		_ = o.DB.SetCardWaitReason(cardID, "")
+	}
 	_ = o.DB.LogEvent(cardID, "moved", "column="+column)
 	switch column {
 	case model.ColWorking:
@@ -370,6 +379,21 @@ func (o *Orchestrator) Emit(ev Event) {
 		o.Notify.NotifyChat(ev.CardID, map[string]any{"kind": "question", "text": ev.Text})
 		o.refreshNotify(ev.CardID, "question")
 
+	case EvWait:
+		// The worker parked the card: it is blocked on an external
+		// response. Stop the run; moving the card back to working
+		// restarts the worker from the remaining steps. The runtime
+		// should block on ctx.Done() (or return done=false) after
+		// emitting this.
+		o.stopRun(ev.CardID)
+		_ = o.DB.SetCardWaitReason(ev.CardID, ev.Reason)
+		_ = o.DB.SetCardColumn(ev.CardID, model.ColWaiting)
+		_ = o.DB.LogEvent(ev.CardID, "wait", ev.Reason)
+		_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: ev.CardID,
+			From: model.FromSystem, Text: "Agent is waiting: " + ev.Reason, CreatedAt: db.Now()})
+		o.Notify.NotifyChat(ev.CardID, map[string]any{"kind": "state", "column": model.ColWaiting, "reason": ev.Reason})
+		o.refreshNotify(ev.CardID, "moved")
+
 	case EvVerdict:
 		if ev.Approved {
 			_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: ev.CardID,
@@ -430,8 +454,9 @@ func (o *Orchestrator) provisionContainer(cardID string) {
 // ---------- boot ----------
 
 // Reconcile restarts workers for cards that were mid-flight when the server
-// stopped. Cards waiting on the user (needs_you) keep their open question;
-// answering it restarts the worker.
+// stopped. Cards waiting on the user (needs_you) keep their open question,
+// and cards parked in waiting stay parked; answering / moving them back to
+// working restarts the worker.
 func (o *Orchestrator) Reconcile(ctx context.Context) {
 	_ = ctx
 	working, _ := o.DB.ListCardsByColumn(model.ColWorking)

@@ -12,6 +12,7 @@ const $ = (id) => document.getElementById(id);
 const COLUMNS = [
   { key: "inbox", label: "Inbox" },
   { key: "working", label: "Working" },
+  { key: "waiting", label: "Waiting" },
   { key: "needs_you", label: "Needs You" },
   { key: "qa", label: "QA" },
   { key: "done", label: "Done" },
@@ -19,6 +20,7 @@ const COLUMNS = [
 
 const state = {
   user: null,
+  view: "board",           // "board" | "admin"
   boards: [],
   boardId: null,
   cards: new Map(),        // id -> CardSummary
@@ -99,12 +101,22 @@ async function api(path, opts = {}) {
 
 function showAuth() {
   state.user = null;
+  state.view = "board";
   state.streamWanted = false;
   closeStream();
   closeChat();
   closeDrawer();
   $("app-view").classList.add("hidden");
   $("auth-view").classList.remove("hidden");
+  // Reset to the board view for the next login.
+  $("board-view").classList.remove("hidden");
+  $("admin-view").classList.add("hidden");
+  $("nav-board").classList.add("active");
+  $("nav-admin").classList.remove("active");
+  $("nav-admin").classList.add("hidden");
+  for (const id of ["board-select", "new-board-btn", "new-card-btn"]) {
+    $(id).classList.remove("hidden");
+  }
   hideError("auth-error");
 }
 
@@ -136,8 +148,26 @@ async function showApp() {
   $("auth-view").classList.add("hidden");
   $("app-view").classList.remove("hidden");
   $("user-label").textContent = state.user.username || "";
+  // Admin view is only reachable for admins (the API 403s otherwise).
+  $("nav-admin").classList.toggle("hidden", !state.user.is_admin);
   await loadBoards();
   connectStream();
+}
+
+/* ---------------- board / admin view switch ---------------- */
+
+function showView(which) {
+  state.view = which;
+  const admin = which === "admin";
+  $("board-view").classList.toggle("hidden", admin);
+  $("admin-view").classList.toggle("hidden", !admin);
+  $("nav-board").classList.toggle("active", !admin);
+  $("nav-admin").classList.toggle("active", admin);
+  // Board controls don't apply to the admin view.
+  for (const id of ["board-select", "new-board-btn", "new-card-btn"]) {
+    $(id).classList.toggle("hidden", admin);
+  }
+  if (admin) loadAdmin();
 }
 
 async function loadBoards() {
@@ -252,6 +282,7 @@ function cardEl(c) {
   const el = document.createElement("div");
   el.className = "card"
     + (c.column === "needs_you" ? " needs-you" : "")
+    + (c.column === "waiting" ? " waiting" : "")
     + (c.id === state.openCardId ? " selected" : "");
 
   const title = document.createElement("div");
@@ -284,6 +315,15 @@ function cardEl(c) {
     meta.appendChild(alarm);
   }
   el.appendChild(meta);
+
+  // Waiting reason, when parked on an external response.
+  if (c.column === "waiting" && c.wait_reason) {
+    const wr = document.createElement("div");
+    wr.className = "card-wait";
+    wr.textContent = "⏳ " + c.wait_reason;
+    wr.title = c.wait_reason;
+    el.appendChild(wr);
+  }
 
   const sub = document.createElement("div");
   sub.className = "card-sub";
@@ -360,6 +400,14 @@ function renderDrawer() {
   h.className = "drawer-title";
   h.textContent = d.title;
   body.appendChild(h);
+
+  // Waiting banner when the card is parked on an external response.
+  if (d.column === "waiting") {
+    const wb = document.createElement("div");
+    wb.className = "wait-banner";
+    wb.textContent = "⏳ Waiting" + (d.wait_reason ? ": " + d.wait_reason : " — move back to Working to resume.");
+    body.appendChild(wb);
+  }
 
   // Source / runtime / container info line (short container id).
   const info = document.createElement("div");
@@ -602,11 +650,11 @@ async function answerQuestion(cardId, questionId) {
   }
 }
 
-async function moveCard(cardId, column) {
+async function moveCard(cardId, column, reason) {
   try {
     const d = await api("/api/cards/" + encodeURIComponent(cardId) + "/move", {
       method: "POST",
-      body: JSON.stringify({ column }),
+      body: JSON.stringify({ column, reason: reason || "" }),
     });
     state.detail = d;
     state.cards.set(d.id, summaryFromDetail(d));
@@ -853,6 +901,256 @@ async function submitNewCard(e) {
   }
 }
 
+/* ---------------- admin view ----------------
+   Sources (RSS), webhooks, and LLM providers. Backend 403s for non-admins;
+   the nav button is hidden for them too (see showApp). */
+
+async function loadAdmin() {
+  if (!state.user || !state.user.is_admin) return;
+  // Board picker for the feed form (defaults to the current board).
+  const sel = $("feed-board");
+  sel.innerHTML = "";
+  for (const b of state.boards) {
+    const opt = document.createElement("option");
+    opt.value = b.id;
+    opt.textContent = b.name;
+    sel.appendChild(opt);
+  }
+  if (state.boardId) sel.value = state.boardId;
+
+  $("webhook-url").textContent = location.origin + "/api/ingest/webhook/:source";
+
+  try {
+    const feeds = (await api("/api/admin/feeds")) || [];
+    renderFeeds(feeds);
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Could not load feeds: " + e.message);
+  }
+  try {
+    const sources = (await api("/api/admin/webhook-sources")) || [];
+    renderWebhookSources(sources);
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Could not load webhook sources: " + e.message);
+  }
+  try {
+    const providers = (await api("/api/admin/providers")) || [];
+    renderProviders(providers);
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Could not load providers: " + e.message);
+  }
+}
+
+function boardName(id) {
+  const b = state.boards.find((x) => x.id === id);
+  return b ? b.name : "—";
+}
+
+function renderFeeds(feeds) {
+  const list = $("feeds-list");
+  list.innerHTML = "";
+  if (feeds.length === 0) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "No RSS sources configured.";
+    list.appendChild(p);
+    return;
+  }
+  for (const f of feeds) {
+    const row = document.createElement("div");
+    row.className = "admin-row";
+
+    const main = document.createElement("div");
+    main.className = "admin-row-main";
+    const name = document.createElement("div");
+    name.className = "admin-row-title";
+    name.textContent = f.name;
+    const url = document.createElement("a");
+    url.className = "admin-row-sub link";
+    url.href = f.url;
+    url.target = "_blank";
+    url.rel = "noopener";
+    url.textContent = f.url;
+    main.append(name, url);
+
+    const meta = document.createElement("div");
+    meta.className = "admin-row-meta";
+    const bits = [
+      boardName(f.board_id),
+      "every " + Math.round((f.interval_sec || 900) / 60) + "m",
+      "polled " + timeAgo(f.last_polled_at ? f.last_polled_at * 1000 : 0),
+      "last item " + timeAgo(f.last_item_at ? f.last_item_at * 1000 : 0),
+    ];
+    meta.textContent = bits.join(" · ");
+
+    const del = document.createElement("button");
+    del.className = "btn danger small";
+    del.textContent = "Delete";
+    del.addEventListener("click", () => deleteFeed(f.id, f.name));
+
+    row.append(main, meta, del);
+    list.appendChild(row);
+  }
+}
+
+async function deleteFeed(id, name) {
+  if (!confirm("Delete RSS source \"" + name + "\"?")) return;
+  try {
+    await api("/api/admin/feeds/" + encodeURIComponent(id), { method: "DELETE" });
+    loadAdmin();
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Delete failed: " + e.message);
+  }
+}
+
+async function submitFeed(e) {
+  e.preventDefault();
+  hideError("feed-error");
+  const name = $("feed-name").value.trim();
+  const url = $("feed-url").value.trim();
+  const boardId = $("feed-board").value;
+  const minutes = Math.max(1, parseInt($("feed-interval").value, 10) || 15);
+  if (!name || !url) {
+    showError("feed-error", "Name and URL are required.");
+    return;
+  }
+  try {
+    await api("/api/admin/feeds", {
+      method: "POST",
+      body: JSON.stringify({ name, url, board_id: boardId, interval_sec: minutes * 60 }),
+    });
+    $("feed-name").value = "";
+    $("feed-url").value = "";
+    toast("Feed added.");
+    loadAdmin();
+  } catch (err) {
+    if (err.message !== "unauthorized") showError("feed-error", err.message);
+  }
+}
+
+function renderWebhookSources(sources) {
+  const el = $("webhook-sources");
+  el.innerHTML = "";
+  if (sources.length === 0) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "No webhook events received yet.";
+    el.appendChild(p);
+    return;
+  }
+  const h = document.createElement("h3");
+  h.textContent = "Sources seen";
+  el.appendChild(h);
+  for (const s of sources) {
+    const row = document.createElement("div");
+    row.className = "admin-row slim";
+    const name = document.createElement("code");
+    name.textContent = s.source;
+    const count = document.createElement("span");
+    count.className = "muted";
+    count.textContent = s.count + (s.count === 1 ? " card" : " cards");
+    row.append(name, count);
+    el.appendChild(row);
+  }
+}
+
+function copyWebhookUrl() {
+  const url = location.origin + "/api/ingest/webhook/:source";
+  const done = () => toast("Webhook URL copied.");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(done, () => toast("Copy failed."));
+  } else {
+    const ta = document.createElement("textarea");
+    ta.value = url;
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand("copy");
+      done();
+    } catch {
+      toast("Copy failed.");
+    }
+    ta.remove();
+  }
+}
+
+function renderProviders(providers) {
+  const list = $("providers-list");
+  list.innerHTML = "";
+  if (providers.length === 0) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "No LLM providers configured.";
+    list.appendChild(p);
+    return;
+  }
+  for (const p of providers) {
+    const row = document.createElement("div");
+    row.className = "admin-row";
+
+    const main = document.createElement("div");
+    main.className = "admin-row-main";
+    const name = document.createElement("div");
+    name.className = "admin-row-title";
+    name.textContent = p.name;
+    const sub = document.createElement("div");
+    sub.className = "admin-row-sub";
+    const bits = [p.provider_type || "openai"];
+    if (p.model) bits.push(p.model);
+    if (p.endpoint) bits.push(p.endpoint);
+    if (p.api_key_masked) bits.push("key " + p.api_key_masked);
+    sub.textContent = bits.join(" · ");
+    main.append(name, sub);
+
+    const del = document.createElement("button");
+    del.className = "btn danger small";
+    del.textContent = "Delete";
+    del.addEventListener("click", () => deleteProvider(p.id, p.name));
+
+    row.append(main, del);
+    list.appendChild(row);
+  }
+}
+
+async function deleteProvider(id, name) {
+  if (!confirm("Delete LLM provider \"" + name + "\"?")) return;
+  try {
+    await api("/api/admin/providers/" + encodeURIComponent(id), { method: "DELETE" });
+    loadAdmin();
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Delete failed: " + e.message);
+  }
+}
+
+async function submitProvider(e) {
+  e.preventDefault();
+  hideError("provider-error");
+  const name = $("prov-name").value.trim();
+  if (!name) {
+    showError("provider-error", "Name is required.");
+    return;
+  }
+  try {
+    await api("/api/admin/providers", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        provider_type: $("prov-type").value,
+        endpoint: $("prov-endpoint").value.trim(),
+        api_key: $("prov-key").value,
+        model: $("prov-model").value.trim(),
+      }),
+    });
+    $("prov-name").value = "";
+    $("prov-endpoint").value = "";
+    $("prov-key").value = "";
+    $("prov-model").value = "";
+    toast("Provider added.");
+    loadAdmin();
+  } catch (err) {
+    if (err.message !== "unauthorized") showError("provider-error", err.message);
+  }
+}
+
 /* ---------------- init ---------------- */
 
 function init() {
@@ -875,6 +1173,8 @@ function init() {
     } catch { /* session may already be gone */ }
     showAuth();
   });
+  $("nav-board").addEventListener("click", () => showView("board"));
+  $("nav-admin").addEventListener("click", () => showView("admin"));
   $("board-select").addEventListener("change", (e) => {
     state.boardId = e.target.value;
     closeDrawer();
@@ -886,7 +1186,19 @@ function init() {
   // Drawer.
   $("drawer-close").addEventListener("click", closeDrawer);
   $("drawer-move").addEventListener("change", (e) => {
-    if (state.openCardId) moveCard(state.openCardId, e.target.value);
+    if (!state.openCardId) return;
+    const column = e.target.value;
+    let reason = "";
+    if (column === "waiting") {
+      const r = prompt("Why is this card waiting? (e.g. waiting on vendor reply)");
+      if (r === null) {
+        // Cancelled: restore the selector to the card's actual column.
+        e.target.value = state.detail ? state.detail.column : "inbox";
+        return;
+      }
+      reason = r.trim();
+    }
+    moveCard(state.openCardId, column, reason);
   });
 
   // Typing guard: while focus is inside a drawer input/textarea we must not
@@ -914,6 +1226,11 @@ function init() {
   $("card-modal").addEventListener("click", (e) => {
     if (e.target === $("card-modal")) closeCardModal();
   });
+
+  // Admin view.
+  $("feed-form").addEventListener("submit", submitFeed);
+  $("provider-form").addEventListener("submit", submitProvider);
+  $("webhook-copy").addEventListener("click", copyWebhookUrl);
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       closeCardModal();

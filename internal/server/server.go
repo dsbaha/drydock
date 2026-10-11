@@ -132,6 +132,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.Handle("GET /api/admin/feeds", authed(http.HandlerFunc(s.handleFeeds)))
 	mux.Handle("POST /api/admin/feeds", authed(http.HandlerFunc(s.handleCreateFeed)))
 	mux.Handle("DELETE /api/admin/feeds/{id}", authed(http.HandlerFunc(s.handleDeleteFeed)))
+	mux.Handle("GET /api/admin/webhook-sources", authed(http.HandlerFunc(s.handleWebhookSources)))
 	mux.Handle("GET /api/admin/providers", authed(http.HandlerFunc(s.handleProviders)))
 	mux.Handle("POST /api/admin/providers", authed(http.HandlerFunc(s.handleCreateProvider)))
 	mux.Handle("DELETE /api/admin/providers/{id}", authed(http.HandlerFunc(s.handleDeleteProvider)))
@@ -264,12 +265,13 @@ func (s *Server) handleCardAnswer(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCardMove(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Column string `json:"column"`
+		Reason string `json:"reason"` // optional: recorded as wait_reason when moving to waiting
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	card, err := s.Orch.MoveCard(r.PathValue("id"), req.Column)
+	card, err := s.Orch.MoveCard(r.PathValue("id"), req.Column, req.Reason)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -388,6 +390,24 @@ func (s *Server) handleDeleteFeed(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.DB.DeleteFeed(r.PathValue("id"))
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleWebhookSources lists the distinct webhook :source names seen in
+// cards, with card counts — a quick view of which integrations are feeding
+// the board.
+func (s *Server) handleWebhookSources(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	sources, err := s.DB.WebhookSources()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if sources == nil {
+		sources = []*model.WebhookSource{}
+	}
+	writeJSON(w, http.StatusOK, sources)
 }
 
 // ---------- admin: llm providers ----------

@@ -138,6 +138,30 @@ func (d *DB) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
+	// Additive migrations for databases created before these columns
+	// existed. Idempotent: skipped when the column is already present.
+	if err := d.ensureColumn("cards", "wait_reason", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("feeds", "last_item_at", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureColumn adds column to table when it is missing (SQLite has no
+// ADD COLUMN IF NOT EXISTS).
+func (d *DB) ensureColumn(table, column, ddl string) error {
+	var n int
+	err := d.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if n == 0 {
+		if _, err := d.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, ddl)); err != nil {
+			return fmt.Errorf("migrate: %w", err)
+		}
+	}
 	return nil
 }
 

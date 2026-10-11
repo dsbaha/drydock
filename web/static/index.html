@@ -37,6 +37,10 @@
   <header class="topbar">
     <div class="brand">Drydock</div>
     <span id="live-dot" class="live-dot" title="Live event stream: green = connected, amber = reconnecting"></span>
+    <nav class="view-nav">
+      <button id="nav-board" class="btn ghost small active">Board</button>
+      <button id="nav-admin" class="btn ghost small hidden">Admin</button>
+    </nav>
     <select id="board-select" title="Board"></select>
     <button id="new-board-btn" class="btn ghost small">+ Board</button>
     <div class="spacer"></div>
@@ -45,7 +49,52 @@
     <button id="logout-btn" class="btn ghost">Log out</button>
   </header>
 
-  <div class="layout">
+  <div id="admin-view" class="admin-view hidden">
+    <div class="admin-wrap">
+      <section class="admin-section">
+        <h2>RSS sources</h2>
+        <p class="muted">Feeds are polled on their interval; each new item becomes a card in the feed's board and auto-starts.</p>
+        <div id="feeds-list"></div>
+        <h3>Add source</h3>
+        <form id="feed-form" class="admin-form">
+          <input id="feed-name" type="text" placeholder="Name" maxlength="80" required>
+          <input id="feed-url" type="url" placeholder="https://example.com/feed.xml" required>
+          <select id="feed-board" title="Target board"></select>
+          <input id="feed-interval" type="number" min="1" value="15" title="Poll interval in minutes">
+          <button type="submit" class="btn primary small">Add feed</button>
+        </form>
+        <p id="feed-error" class="error hidden"></p>
+      </section>
+      <section class="admin-section">
+        <h2>Webhooks</h2>
+        <p class="muted">POST JSON to <code id="webhook-url"></code> — any <code>:source</code> name auto-registers on first POST and starts a card in the default board's inbox.</p>
+        <div class="admin-row">
+          <button id="webhook-copy" class="btn small">Copy URL</button>
+        </div>
+        <div id="webhook-sources"></div>
+      </section>
+      <section class="admin-section">
+        <h2>LLM providers</h2>
+        <p class="muted">API keys are stored server-side and never exposed to the browser.</p>
+        <div id="providers-list"></div>
+        <h3>Add provider</h3>
+        <form id="provider-form" class="admin-form">
+          <input id="prov-name" type="text" placeholder="Name" maxlength="80" required>
+          <select id="prov-type" title="Provider type">
+            <option value="openai">OpenAI / OpenAI-compatible</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+          <input id="prov-endpoint" type="url" placeholder="Endpoint URL (optional)">
+          <input id="prov-key" type="password" placeholder="API key" autocomplete="new-password">
+          <input id="prov-model" type="text" placeholder="Model (optional)">
+          <button type="submit" class="btn primary small">Add provider</button>
+        </form>
+        <p id="provider-error" class="error hidden"></p>
+      </section>
+    </div>
+  </div>
+
+  <div class="layout" id="board-view">
     <main class="board-wrap">
       <div id="board" class="board"></div>
       <div id="board-empty" class="empty-state hidden">
@@ -62,6 +111,7 @@
         <select id="drawer-move" title="Move to column">
           <option value="inbox">Inbox</option>
           <option value="working">Working</option>
+          <option value="waiting">Waiting</option>
           <option value="needs_you">Needs You</option>
           <option value="qa">QA</option>
           <option value="done">Done</option>

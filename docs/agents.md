@@ -31,6 +31,7 @@ events.
 | `step_done`  | `StepID`                        | Marks the step done, recomputes progress %, broadcasts        |
 | `message`    | `From` (`agent`), `Text`        | Appends to the card chat                                       |
 | `question`   | `From` (`worker`/`verifier`), `Text` | Creates the question, moves the card to `needs_you`, raises the 🔔 alarm badge |
+| `wait`       | `Reason`                        | Parks the card in the `waiting` column with the reason; the run is stopped |
 | `verdict`    | `Approved`, `Note`              | Verifier only: approve → `done`; reject → back to `working` with the note |
 | `log`        | `Text`                          | Appends to the card's event log                               |
 
@@ -78,6 +79,14 @@ the user instead of guessing.
   resume after a server restart the open question is already answered.
 - **Steps are the progress bar.** The % badge is `done/total` — emit
   `EvStepDone` as work lands, don't fake it.
+- **Parking on external waits.** When the task is blocked on something
+  outside the agent's control (a vendor reply, a deploy window, an approval),
+  emit `EvWait` with a short `Reason` and then block on `ctx.Done()` (or
+  return `done=false`). The orchestrator stops the run and parks the card in
+  the `waiting` column with the reason shown as a badge. When the user moves
+  the card back to `working`, your `Run` is called again with the remaining
+  steps — treat it as a resume, not a restart: don't redo finished work and
+  don't re-emit the wait unless the blocker is genuinely still there.
 - **Containers are optional.** `ContainerID` may be empty (Docker down).
   Degrade gracefully: work in-process or record that the container was
   unavailable.

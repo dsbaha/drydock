@@ -22,6 +22,7 @@ const (
 	EvStepDone = "step_done" // a plan step completed; StepID set
 	EvMessage  = "message"   // chat turn; From + Text set
 	EvQuestion = "question"  // agent paused with a question; From + Text set
+	EvWait     = "wait"      // agent parked the card in waiting; Reason set
 	EvVerdict  = "verdict"   // verifier decision; Approved + Note set
 	EvLog      = "log"       // event-log entry only; Text set
 )
@@ -33,6 +34,7 @@ type Event struct {
 	StepID   string
 	From     string // message sender / question asker
 	Text     string // message or question text
+	Reason   string // wait reason (EvWait)
 	Approved bool   // verdict
 	Note     string // verdict note
 }

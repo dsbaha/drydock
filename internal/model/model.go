@@ -5,13 +5,14 @@ package model
 const (
 	ColInbox    = "inbox"
 	ColWorking  = "working"
+	ColWaiting  = "waiting" // parked: blocked on something external, worker paused
 	ColNeedsYou = "needs_you"
 	ColQA       = "qa"
 	ColDone     = "done"
 )
 
 // Columns lists the pipeline in display order.
-var Columns = []string{ColInbox, ColWorking, ColNeedsYou, ColQA, ColDone}
+var Columns = []string{ColInbox, ColWorking, ColWaiting, ColNeedsYou, ColQA, ColDone}
 
 // ValidColumn reports whether c is a known kanban column.
 func ValidColumn(c string) bool {
@@ -54,6 +55,7 @@ type Card struct {
 	ProgressPct    int    `json:"progress_pct"`
 	ContainerID    string `json:"container_id"`
 	AgentRuntime   string `json:"agent_runtime"`
+	WaitReason     string `json:"wait_reason"` // why the card sits in waiting ("" when not waiting)
 	HasOpenQuestion bool  `json:"has_open_question"`
 	CreatedAt      int64  `json:"created_at"`
 	UpdatedAt      int64  `json:"updated_at"`
@@ -110,7 +112,14 @@ type Feed struct {
 	BoardID      string `json:"board_id"`
 	IntervalSec  int    `json:"interval_sec"`
 	LastPolledAt int64  `json:"last_polled_at"`
+	LastItemAt   int64  `json:"last_item_at"` // last poll that produced a card
 	CreatedAt    int64  `json:"created_at"`
+}
+
+// WebhookSource is one distinct webhook :source seen in cards, with its card count.
+type WebhookSource struct {
+	Source string `json:"source"`
+	Count  int    `json:"count"`
 }
 
 // LLMProvider is an admin-configured LLM service agents can use.

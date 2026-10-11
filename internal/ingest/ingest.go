@@ -147,6 +147,9 @@ func (s *Service) PollFeed(feed *model.Feed) (int, error) {
 		created++
 	}
 	_ = s.DB.TouchFeed(feed.ID, db.Now())
+	if created > 0 {
+		_ = s.DB.SetFeedLastItem(feed.ID, db.Now())
+	}
 	return created, nil
 }
 

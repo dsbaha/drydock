@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -184,6 +185,156 @@ func TestStepHistoryReuse(t *testing.T) {
 		if labels[i] != custom[i] {
 			t.Fatalf("expected reused plan %v, got %v", custom, labels)
 		}
+	}
+}
+
+// ---------- test-only runtimes ----------
+
+// steadyRuntime walks the step plan on a fixed timer and never asks
+// questions, so pause/resume timing is deterministic.
+type steadyRuntime struct {
+	once   sync.Once
+	stopCh chan struct{}
+}
+
+func newSteadyRuntime() *steadyRuntime { return &steadyRuntime{stopCh: make(chan struct{})} }
+
+func (s *steadyRuntime) Name() string { return "steady" }
+
+func (s *steadyRuntime) Run(ctx context.Context, rc *RunContext) (bool, error) {
+	emit := func(ev Event) { ev.CardID = rc.Card.ID; rc.Emit.Emit(ev) }
+	for _, st := range rc.Steps {
+		if st.Done {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return false, nil
+		case <-s.stopCh:
+			return false, nil
+		case <-time.After(50 * time.Millisecond):
+		}
+		emit(Event{Kind: EvStepDone, StepID: st.ID})
+	}
+	return true, nil
+}
+
+func (s *steadyRuntime) Answer(_ context.Context, _ string) error { return nil }
+func (s *steadyRuntime) Chat(_ context.Context, _ string) error   { return nil }
+func (s *steadyRuntime) Stop()                                   { s.once.Do(func() { close(s.stopCh) }) }
+
+// waitEmitRuntime parks the card via an EvWait event, then blocks until its
+// context is cancelled.
+type waitEmitRuntime struct{}
+
+func (w *waitEmitRuntime) Name() string { return "waitemit" }
+
+func (w *waitEmitRuntime) Run(ctx context.Context, rc *RunContext) (bool, error) {
+	rc.Emit.Emit(Event{Kind: EvWait, CardID: rc.Card.ID, Reason: "need vendor token"})
+	<-ctx.Done()
+	return false, nil
+}
+
+func (w *waitEmitRuntime) Answer(_ context.Context, _ string) error { return nil }
+func (w *waitEmitRuntime) Chat(_ context.Context, _ string) error   { return nil }
+func (w *waitEmitRuntime) Stop()                                    {}
+
+// TestWaitingColumn: moving a card to waiting pauses the worker (progress
+// freezes) and records the reason; moving back to working clears the reason
+// and resumes the worker from the remaining steps.
+func TestWaitingColumn(t *testing.T) {
+	o, database := testOrchestrator(t)
+	o.RegisterRuntime("steady", func() Runtime { return newSteadyRuntime() })
+	o.DefaultRuntime = "steady"
+	board, err := database.EnsureDefaultBoard()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	card, err := o.IngestCard(board.ID, "Wait for vendor", "", "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "working", 5*time.Second, func() bool {
+		return getCard(t, database, card.ID).Column == model.ColWorking
+	})
+	// Let the worker make some progress first.
+	waitFor(t, "progress", 5*time.Second, func() bool {
+		return getCard(t, database, card.ID).ProgressPct > 0
+	})
+
+	moved, err := o.MoveCard(card.ID, "waiting", "vendor API is down")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.Column != model.ColWaiting {
+		t.Fatalf("column = %q, want waiting", moved.Column)
+	}
+	if moved.WaitReason != "vendor API is down" {
+		t.Fatalf("wait_reason = %q, want the reason", moved.WaitReason)
+	}
+
+	// The worker is paused: progress must not advance while parked.
+	before := getCard(t, database, card.ID).ProgressPct
+	time.Sleep(200 * time.Millisecond)
+	if after := getCard(t, database, card.ID).ProgressPct; after != before {
+		t.Fatalf("progress advanced while waiting: %d -> %d", before, after)
+	}
+
+	// Moving back to working clears the reason and resumes to done.
+	resumed, err := o.MoveCard(card.ID, "working", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Column != model.ColWorking {
+		t.Fatalf("column = %q, want working", resumed.Column)
+	}
+	if resumed.WaitReason != "" {
+		t.Fatalf("wait_reason = %q, want cleared", resumed.WaitReason)
+	}
+	waitFor(t, "done", 10*time.Second, func() bool {
+		return getCard(t, database, card.ID).Column == model.ColDone
+	})
+}
+
+// TestWaitEvent: a runtime-emitted EvWait parks the card in waiting with the
+// given reason and stops the run; moving back to working resumes it.
+func TestWaitEvent(t *testing.T) {
+	o, database := testOrchestrator(t)
+	// First run parks the card via EvWait; the resumed run uses the steady
+	// worker and completes.
+	waited := false
+	o.RegisterRuntime("waitonce", func() Runtime {
+		if !waited {
+			waited = true
+			return &waitEmitRuntime{}
+		}
+		return newSteadyRuntime()
+	})
+	o.DefaultRuntime = "waitonce"
+	board, err := database.EnsureDefaultBoard()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	card, err := o.IngestCard(board.ID, "Needs a token", "", "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "wait parked", 5*time.Second, func() bool {
+		c := getCard(t, database, card.ID)
+		return c.Column == model.ColWaiting && c.WaitReason == "need vendor token"
+	})
+
+	// Resume: the worker restarts and the card should run to done via QA.
+	if _, err := o.MoveCard(card.ID, "working", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "done", 10*time.Second, func() bool {
+		return getCard(t, database, card.ID).Column == model.ColDone
+	})
+	if c := getCard(t, database, card.ID); c.WaitReason != "" {
+		t.Fatalf("wait_reason = %q, want cleared", c.WaitReason)
 	}
 }
 
