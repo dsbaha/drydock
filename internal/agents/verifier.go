@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,8 @@ var verifierSteps = []string{
 type VerifierRuntime struct {
 	stepDelay time.Duration
 	stopCh    chan struct{}
+	mu        sync.Mutex
+	stopped   bool
 }
 
 // NewVerifierRuntime builds the demo verifier.
@@ -63,4 +66,12 @@ func (v *VerifierRuntime) Run(ctx context.Context, rc *RunContext) (bool, error)
 
 func (v *VerifierRuntime) Answer(_ context.Context, _ string) error { return nil }
 func (v *VerifierRuntime) Chat(_ context.Context, _ string) error  { return nil }
-func (v *VerifierRuntime) Stop()                                    { close(v.stopCh) }
+// Stop terminates the run. Safe to call more than once.
+func (v *VerifierRuntime) Stop() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.stopped {
+		v.stopped = true
+		close(v.stopCh)
+	}
+}

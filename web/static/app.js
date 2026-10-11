@@ -414,7 +414,7 @@ function renderDrawer() {
   info.className = "drawer-info";
   const infoBits = [d.source || "manual"];
   if (d.agent_runtime) infoBits.push(d.agent_runtime);
-  infoBits.push(d.container_id ? "container " + shortContainer(d.container_id) : "no container");
+  infoBits.push(d.container_id ? "container " + shortContainer(d.container_id) : (d.column === "done" ? "container removed" : "no container"));
   infoBits.push(timeAgo(d.updated_at));
   infoBits.forEach((b, i) => {
     if (i > 0) {

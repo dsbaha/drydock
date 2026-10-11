@@ -368,3 +368,123 @@ func TestVerifierSendback(t *testing.T) {
 		t.Fatalf("expected 1 send-back, got %d", n)
 	}
 }
+
+// TestMoveToDoneRemovesContainer: MoveToDone moves the card to done, clears
+// the container ID (best-effort without Docker), logs a container_removed
+// event, and posts a system message.
+func TestMoveToDoneRemovesContainer(t *testing.T) {
+	o, database := testOrchestrator(t)
+	board, err := database.EnsureDefaultBoard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := o.IngestCard(board.ID, "Done cleanup", "", "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a provisioned container (no Docker client in tests).
+	if err := database.SetCardContainer(card.ID, "fake-container-id"); err != nil {
+		t.Fatal(err)
+	}
+	o.MoveToDone(card.ID)
+
+	c := getCard(t, database, card.ID)
+	if c.Column != model.ColDone {
+		t.Fatalf("column = %q, want done", c.Column)
+	}
+	if c.ContainerID != "" {
+		t.Fatalf("ContainerID = %q, want cleared", c.ContainerID)
+	}
+	if c.ProgressPct != 100 {
+		t.Fatalf("progress = %d, want 100", c.ProgressPct)
+	}
+	events, err := database.ListEvents(card.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, e := range events {
+		if e.Kind == "container_removed" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("no container_removed event logged")
+	}
+	msgs, err := database.ListMessages(card.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen = false
+	for _, m := range msgs {
+		if m.From == model.FromSystem && m.Text == "Container removed." {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("no \"Container removed.\" system message posted")
+	}
+}
+
+// TestReopenAfterDone: a card that reaches done through the natural pipeline
+// (verifier approval removes the container) can be moved back to working and
+// completes again — the reopened run provisions from the kept volume.
+func TestReopenAfterDone(t *testing.T) {
+	o, database := testOrchestrator(t)
+	board, err := database.EnsureDefaultBoard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := o.IngestCard(board.ID, "Reopen lifecycle", "", "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a provisioned container so the cleanup path has something to clear.
+	if err := database.SetCardContainer(card.ID, "fake-container-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drive the natural pipeline: working → question → answer → qa → done.
+	waitFor(t, "open question", 5*time.Second, func() bool {
+		return getCard(t, database, card.ID).HasOpenQuestion
+	})
+	q, err := database.OpenQuestion(card.ID)
+	if err != nil || q == nil {
+		t.Fatalf("expected open question: %v", err)
+	}
+	if err := o.AnswerQuestion(card.ID, q.ID, "thorough"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "done", 10*time.Second, func() bool {
+		return getCard(t, database, card.ID).Column == model.ColDone
+	})
+	if c := getCard(t, database, card.ID); c.ContainerID != "" {
+		t.Fatalf("ContainerID = %q after verdict, want cleared", c.ContainerID)
+	}
+
+	// Reopen: back to working. The question was already answered, so the
+	// worker does not re-ask and the card completes again.
+	moved, err := o.MoveCard(card.ID, model.ColWorking, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.Column != model.ColWorking {
+		t.Fatalf("column = %q, want working", moved.Column)
+	}
+	waitFor(t, "done again", 10*time.Second, func() bool {
+		return getCard(t, database, card.ID).Column == model.ColDone
+	})
+	c := getCard(t, database, card.ID)
+	if c.ContainerID != "" {
+		t.Fatalf("ContainerID = %q after second done, want cleared", c.ContainerID)
+	}
+	if c.ProgressPct != 100 {
+		t.Fatalf("progress = %d, want 100", c.ProgressPct)
+	}
+	steps, _ := database.ListSteps(card.ID)
+	for _, s := range steps {
+		if !s.Done {
+			t.Fatalf("step %q not done after reopen", s.Label)
+		}
+	}
+}

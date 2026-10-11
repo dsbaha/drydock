@@ -227,8 +227,7 @@ func (o *Orchestrator) MoveToQA(cardID string) {
 		// when the verdict left it in qa (e.g. a custom verifier that just
 		// returns done=true).
 		if c, _ := o.DB.GetCard(cardID); c != nil && c.Column == model.ColQA {
-			_ = o.DB.SetCardColumn(cardID, model.ColDone)
-			o.refreshNotify(cardID, "moved")
+			o.MoveToDone(cardID)
 		}
 	}()
 }
@@ -250,8 +249,8 @@ func (o *Orchestrator) SendBack(cardID, note, from string) error {
 // MoveCard is the manual column move (review accept, triage, waiting, …).
 // Moving to waiting parks the card with an optional reason and pauses the
 // worker (the run is stopped); the reason is cleared when the card leaves
-// waiting. Moving back to working restarts the worker from the remaining
-// steps.
+// waiting. Moving to done removes the card's container (the volume is kept).
+// Moving back to working restarts the worker from the remaining steps.
 func (o *Orchestrator) MoveCard(cardID, column, reason string) (*model.Card, error) {
 	if !model.ValidColumn(column) {
 		return nil, fmt.Errorf("unknown column %q", column)
@@ -273,6 +272,8 @@ func (o *Orchestrator) MoveCard(cardID, column, reason string) (*model.Card, err
 		o.StartCard(cardID)
 	case model.ColQA:
 		o.MoveToQA(cardID)
+	case model.ColDone:
+		o.MoveToDone(cardID)
 	}
 	return o.DB.GetCard(cardID)
 }
@@ -329,22 +330,69 @@ func (o *Orchestrator) ChatMessage(cardID, text string) error {
 // StopContainer stops and removes the card's container. The named volume is
 // kept, so /workspace survives.
 func (o *Orchestrator) StopContainer(cardID string) error {
+	removed, err := o.removeContainer(cardID)
+	if err != nil {
+		return err
+	}
+	if removed == "" {
+		return fmt.Errorf("no container to stop")
+	}
+	_ = o.DB.LogEvent(cardID, "container_stopped", "")
+	o.refreshNotify(cardID, "updated")
+	return nil
+}
+
+// removeContainer stops and removes the card's container and returns the
+// removed container ID, or "" when there was nothing to remove (no container
+// recorded, or no Docker client). The named volume is kept, so the
+// /workspace work artifacts survive — a reopened card gets a fresh container
+// mounted on the same volume. Stale container IDs are cleared even when
+// there is nothing to remove.
+func (o *Orchestrator) removeContainer(cardID string) (string, error) {
 	card, err := o.DB.GetCard(cardID)
 	if err != nil || card == nil {
-		return fmt.Errorf("card not found")
+		return "", fmt.Errorf("card not found")
 	}
 	if card.ContainerID == "" || o.Docker == nil {
-		return fmt.Errorf("no container to stop")
+		_ = o.DB.SetCardContainer(cardID, "")
+		return "", nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := o.Docker.StopAndRemove(ctx, card.ContainerID); err != nil {
-		return err
+		return "", err
 	}
+	removed := card.ContainerID
 	_ = o.DB.SetCardContainer(cardID, "")
-	_ = o.DB.LogEvent(cardID, "container_stopped", "")
-	o.refreshNotify(cardID, "updated")
-	return nil
+	return removed, nil
+}
+
+// MoveToDone transitions a card to done: cancels any live run, marks
+// progress complete, and removes the card's container (see removeContainer —
+// the named volume is kept). Container removal is best-effort: when there is
+// no container, no Docker client, or removal fails, the done transition still
+// succeeds and the outcome is logged, never fatal.
+func (o *Orchestrator) MoveToDone(cardID string) {
+	card, err := o.DB.GetCard(cardID)
+	if err != nil || card == nil {
+		return
+	}
+	o.stopRun(cardID)
+	removed, err := o.removeContainer(cardID)
+	detail := "no container"
+	switch {
+	case err != nil:
+		log.Printf("drydock: remove container for done card %s: %v", cardID, err)
+		detail = "error: " + err.Error()
+	case removed != "":
+		detail = "container=" + removed
+	}
+	_ = o.DB.LogEvent(cardID, "container_removed", detail)
+	_ = o.DB.SetCardColumn(cardID, model.ColDone)
+	_ = o.DB.SetCardProgress(cardID, 100)
+	_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: cardID,
+		From: model.FromSystem, Text: "Container removed.", CreatedAt: db.Now()})
+	o.refreshNotify(cardID, "moved")
 }
 
 // ---------- event handling (Emitter) ----------
@@ -399,8 +447,7 @@ func (o *Orchestrator) Emit(ev Event) {
 			_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: ev.CardID,
 				From: model.FromSystem, Text: "Verifier approved: " + ev.Note, CreatedAt: db.Now()})
 			_ = o.DB.LogEvent(ev.CardID, "verdict_approved", ev.Note)
-			_ = o.DB.SetCardColumn(ev.CardID, model.ColDone)
-			o.refreshNotify(ev.CardID, "moved")
+			o.MoveToDone(ev.CardID)
 		} else {
 			_ = o.DB.LogEvent(ev.CardID, "verdict_rejected", ev.Note)
 			_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: ev.CardID,
