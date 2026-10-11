@@ -938,6 +938,55 @@ async function loadAdmin() {
   } catch (e) {
     if (e.message !== "unauthorized") toast("Could not load providers: " + e.message);
   }
+  await loadRejected();
+}
+
+/* Inline intake-filter editor shared by feeds and webhook sources.
+   onSave(enabled, instructions) persists via the caller's PUT endpoint. */
+function filterEditor(current, onSave) {
+  const ed = document.createElement("div");
+  ed.className = "filter-editor";
+  const label = document.createElement("label");
+  label.className = "checkline";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = !!current.enabled;
+  label.append(cb, document.createTextNode(" Enable LLM intake filter"));
+  const ta = document.createElement("textarea");
+  ta.rows = 3;
+  ta.placeholder = "Intake rules, e.g.: Accept only posts about X; reject ads, job listings, and duplicates.";
+  ta.value = current.instructions || "";
+  const actions = document.createElement("div");
+  actions.className = "filter-editor-actions";
+  const save = document.createElement("button");
+  save.className = "btn primary small";
+  save.textContent = "Save";
+  const cancel = document.createElement("button");
+  cancel.className = "btn small";
+  cancel.textContent = "Cancel";
+  actions.append(save, cancel);
+  ed.append(label, ta, actions);
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      await onSave(cb.checked, ta.value.trim());
+      loadAdmin();
+    } catch (e) {
+      if (e.message !== "unauthorized") toast("Save failed: " + e.message);
+      save.disabled = false;
+    }
+  });
+  cancel.addEventListener("click", () => ed.remove());
+  return ed;
+}
+
+function toggleFilterEditor(wrap, current, onSave) {
+  const existing = wrap.querySelector(".filter-editor");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+  wrap.appendChild(filterEditor(current, onSave));
 }
 
 function boardName(id) {
@@ -956,6 +1005,7 @@ function renderFeeds(feeds) {
     return;
   }
   for (const f of feeds) {
+    const wrap = document.createElement("div");
     const row = document.createElement("div");
     row.className = "admin-row";
 
@@ -979,16 +1029,34 @@ function renderFeeds(feeds) {
       "every " + Math.round((f.interval_sec || 900) / 60) + "m",
       "polled " + timeAgo(f.last_polled_at ? f.last_polled_at * 1000 : 0),
       "last item " + timeAgo(f.last_item_at ? f.last_item_at * 1000 : 0),
+      f.filter_enabled ? "🔍 filtered" : "unfiltered",
     ];
     meta.textContent = bits.join(" · ");
+
+    const filtBtn = document.createElement("button");
+    filtBtn.className = "btn small";
+    filtBtn.textContent = "Filter";
+    filtBtn.title = "Edit LLM intake filter";
+    filtBtn.addEventListener("click", () =>
+      toggleFilterEditor(
+        wrap,
+        { enabled: f.filter_enabled, instructions: f.filter_instructions },
+        (enabled, instructions) =>
+          api("/api/admin/feeds/" + encodeURIComponent(f.id), {
+            method: "PUT",
+            body: JSON.stringify({ filter_enabled: enabled, filter_instructions: instructions }),
+          })
+      )
+    );
 
     const del = document.createElement("button");
     del.className = "btn danger small";
     del.textContent = "Delete";
     del.addEventListener("click", () => deleteFeed(f.id, f.name));
 
-    row.append(main, meta, del);
-    list.appendChild(row);
+    row.append(main, meta, filtBtn, del);
+    wrap.appendChild(row);
+    list.appendChild(wrap);
   }
 }
 
@@ -1009,6 +1077,8 @@ async function submitFeed(e) {
   const url = $("feed-url").value.trim();
   const boardId = $("feed-board").value;
   const minutes = Math.max(1, parseInt($("feed-interval").value, 10) || 15);
+  const filterEnabled = $("feed-filter-enabled").checked;
+  const filterInstructions = $("feed-filter-instructions").value.trim();
   if (!name || !url) {
     showError("feed-error", "Name and URL are required.");
     return;
@@ -1016,10 +1086,19 @@ async function submitFeed(e) {
   try {
     await api("/api/admin/feeds", {
       method: "POST",
-      body: JSON.stringify({ name, url, board_id: boardId, interval_sec: minutes * 60 }),
+      body: JSON.stringify({
+        name,
+        url,
+        board_id: boardId,
+        interval_sec: minutes * 60,
+        filter_enabled: filterEnabled,
+        filter_instructions: filterInstructions,
+      }),
     });
     $("feed-name").value = "";
     $("feed-url").value = "";
+    $("feed-filter-enabled").checked = false;
+    $("feed-filter-instructions").value = "";
     toast("Feed added.");
     loadAdmin();
   } catch (err) {
@@ -1041,6 +1120,7 @@ function renderWebhookSources(sources) {
   h.textContent = "Sources seen";
   el.appendChild(h);
   for (const s of sources) {
+    const wrap = document.createElement("div");
     const row = document.createElement("div");
     row.className = "admin-row slim";
     const name = document.createElement("code");
@@ -1048,8 +1128,27 @@ function renderWebhookSources(sources) {
     const count = document.createElement("span");
     count.className = "muted";
     count.textContent = s.count + (s.count === 1 ? " card" : " cards");
-    row.append(name, count);
-    el.appendChild(row);
+    const badge = document.createElement("span");
+    badge.className = "pill";
+    badge.textContent = s.filter_enabled ? "🔍 filtered" : "unfiltered";
+    const filtBtn = document.createElement("button");
+    filtBtn.className = "btn small";
+    filtBtn.textContent = "Filter";
+    filtBtn.title = "Edit LLM intake filter";
+    filtBtn.addEventListener("click", () =>
+      toggleFilterEditor(
+        wrap,
+        { enabled: s.filter_enabled, instructions: s.filter_instructions },
+        (enabled, instructions) =>
+          api("/api/admin/webhook-sources/" + encodeURIComponent(s.source), {
+            method: "PUT",
+            body: JSON.stringify({ filter_enabled: enabled, filter_instructions: instructions }),
+          })
+      )
+    );
+    row.append(name, count, badge, filtBtn);
+    wrap.appendChild(row);
+    el.appendChild(wrap);
   }
 }
 
@@ -1070,6 +1169,76 @@ function copyWebhookUrl() {
       toast("Copy failed.");
     }
     ta.remove();
+  }
+}
+
+/* ---------------- rejected items ----------------
+   Items the intake filter declined. The tuning loop for filter
+   instructions: review what was rejected, or accept one anyway. */
+
+async function loadRejected() {
+  try {
+    const data = (await api("/api/admin/rejected?limit=50")) || { items: [], filter_fallbacks: 0 };
+    renderRejected(data);
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Could not load rejected items: " + e.message);
+  }
+}
+
+function renderRejected(data) {
+  const hint = $("filter-fallback-hint");
+  const n = data.filter_fallbacks || 0;
+  hint.classList.toggle("hidden", n === 0);
+  if (n > 0) {
+    hint.textContent =
+      "⚠ " +
+      n +
+      " recent card" +
+      (n === 1 ? " was" : "s were") +
+      " accepted because the intake filter was unavailable (no LLM provider configured or the provider errored). Add a provider above to enable filtering.";
+  }
+  const el = $("rejected-list");
+  el.innerHTML = "";
+  const items = data.items || [];
+  if (items.length === 0) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "No rejected items.";
+    el.appendChild(p);
+    return;
+  }
+  for (const it of items) {
+    const row = document.createElement("div");
+    row.className = "admin-row";
+    const main = document.createElement("div");
+    main.className = "admin-row-main";
+    const title = document.createElement("div");
+    title.className = "admin-row-title";
+    title.textContent = it.title;
+    const sub = document.createElement("div");
+    sub.className = "admin-row-sub";
+    sub.textContent = it.kind + " · " + it.source + " · " + timeAgo(it.created_at * 1000);
+    const reason = document.createElement("div");
+    reason.className = "admin-row-sub";
+    reason.textContent = "Rejected: " + (it.reason || "no reason given");
+    main.append(title, sub, reason);
+    const accept = document.createElement("button");
+    accept.className = "btn small";
+    accept.textContent = "Accept anyway";
+    accept.title = "Create the card this item would have become";
+    accept.addEventListener("click", () => acceptRejected(it.id));
+    row.append(main, accept);
+    el.appendChild(row);
+  }
+}
+
+async function acceptRejected(id) {
+  try {
+    await api("/api/admin/rejected/" + encodeURIComponent(id) + "/accept", { method: "POST" });
+    toast("Card created and started.");
+    loadAdmin();
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Accept failed: " + e.message);
   }
 }
 

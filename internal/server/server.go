@@ -7,6 +7,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -131,8 +132,12 @@ func (s *Server) Routes() *http.ServeMux {
 	// Admin: RSS feeds and LLM providers.
 	mux.Handle("GET /api/admin/feeds", authed(http.HandlerFunc(s.handleFeeds)))
 	mux.Handle("POST /api/admin/feeds", authed(http.HandlerFunc(s.handleCreateFeed)))
+	mux.Handle("PUT /api/admin/feeds/{id}", authed(http.HandlerFunc(s.handleUpdateFeed)))
 	mux.Handle("DELETE /api/admin/feeds/{id}", authed(http.HandlerFunc(s.handleDeleteFeed)))
 	mux.Handle("GET /api/admin/webhook-sources", authed(http.HandlerFunc(s.handleWebhookSources)))
+	mux.Handle("PUT /api/admin/webhook-sources/{source}", authed(http.HandlerFunc(s.handleUpdateWebhookSource)))
+	mux.Handle("GET /api/admin/rejected", authed(http.HandlerFunc(s.handleRejected)))
+	mux.Handle("POST /api/admin/rejected/{id}/accept", authed(http.HandlerFunc(s.handleAcceptRejected)))
 	mux.Handle("GET /api/admin/providers", authed(http.HandlerFunc(s.handleProviders)))
 	mux.Handle("POST /api/admin/providers", authed(http.HandlerFunc(s.handleCreateProvider)))
 	mux.Handle("DELETE /api/admin/providers/{id}", authed(http.HandlerFunc(s.handleDeleteProvider)))
@@ -314,12 +319,17 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	card, err := s.Ing.Webhook(r.PathValue("source"), payload)
+	out, err := s.Ing.Webhook(r.PathValue("source"), payload)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "ingest failed")
 		return
 	}
-	d, _ := s.cardDetail(card)
+	if !out.Accepted {
+		// Intake filter declined it: recorded for review, nothing to start.
+		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": false, "reason": out.Reason})
+		return
+	}
+	d, _ := s.cardDetail(out.Card)
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -345,10 +355,12 @@ func (s *Server) handleCreateFeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name        string `json:"name"`
-		URL         string `json:"url"`
-		BoardID     string `json:"board_id"`
-		IntervalSec int    `json:"interval_sec"`
+		Name               string `json:"name"`
+		URL                string `json:"url"`
+		BoardID            string `json:"board_id"`
+		IntervalSec        int    `json:"interval_sec"`
+		FilterEnabled      bool   `json:"filter_enabled"`
+		FilterInstructions string `json:"filter_instructions"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
@@ -375,13 +387,53 @@ func (s *Server) handleCreateFeed(w http.ResponseWriter, r *http.Request) {
 	}
 	f := &model.Feed{
 		ID: db.NewID(), Name: strings.TrimSpace(req.Name), URL: strings.TrimSpace(req.URL),
-		BoardID: boardID, IntervalSec: req.IntervalSec, CreatedAt: db.Now(),
+		BoardID: boardID, IntervalSec: req.IntervalSec,
+		FilterEnabled: req.FilterEnabled, FilterInstructions: strings.TrimSpace(req.FilterInstructions),
+		CreatedAt: db.Now(),
 	}
 	if err := s.DB.CreateFeed(f); err != nil {
 		writeErr(w, http.StatusBadRequest, "could not create feed (duplicate URL?)")
 		return
 	}
 	writeJSON(w, http.StatusCreated, f)
+}
+
+// handleUpdateFeed updates a feed's intake-filter toggle and instructions.
+func (s *Server) handleUpdateFeed(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	f, err := s.DB.GetFeed(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if f == nil {
+		writeErr(w, http.StatusNotFound, "feed not found")
+		return
+	}
+	var req struct {
+		FilterEnabled      *bool   `json:"filter_enabled"`
+		FilterInstructions *string `json:"filter_instructions"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	enabled := f.FilterEnabled
+	instructions := f.FilterInstructions
+	if req.FilterEnabled != nil {
+		enabled = *req.FilterEnabled
+	}
+	if req.FilterInstructions != nil {
+		instructions = strings.TrimSpace(*req.FilterInstructions)
+	}
+	if err := s.DB.UpdateFeedFilter(f.ID, enabled, instructions); err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	f, _ = s.DB.GetFeed(f.ID)
+	writeJSON(w, http.StatusOK, f)
 }
 
 func (s *Server) handleDeleteFeed(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +460,124 @@ func (s *Server) handleWebhookSources(w http.ResponseWriter, r *http.Request) {
 		sources = []*model.WebhookSource{}
 	}
 	writeJSON(w, http.StatusOK, sources)
+}
+
+// handleUpdateWebhookSource sets a webhook source's intake-filter toggle and
+// instructions. The source row is created disabled on first sight, so this
+// upserts.
+func (s *Server) handleUpdateWebhookSource(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	source := strings.TrimSpace(r.PathValue("source"))
+	if source == "" {
+		writeErr(w, http.StatusBadRequest, "source is required")
+		return
+	}
+	if !strings.HasPrefix(source, "webhook:") {
+		source = "webhook:" + source
+	}
+	var req struct {
+		FilterEnabled      *bool   `json:"filter_enabled"`
+		FilterInstructions *string `json:"filter_instructions"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	f, err := s.DB.EnsureWebhookFilter(source)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	enabled := f.FilterEnabled
+	instructions := f.FilterInstructions
+	if req.FilterEnabled != nil {
+		enabled = *req.FilterEnabled
+	}
+	if req.FilterInstructions != nil {
+		instructions = strings.TrimSpace(*req.FilterInstructions)
+	}
+	if err := s.DB.SetWebhookFilter(source, enabled, instructions); err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	f, _ = s.DB.EnsureWebhookFilter(source)
+	writeJSON(w, http.StatusOK, f)
+}
+
+// ---------- admin: rejected items ----------
+
+// handleRejected lists items the intake filter declined, newest first, with
+// a count of recent fail-open accepts (filter unavailable) so the admin
+// knows to configure an LLM provider.
+func (s *Server) handleRejected(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	offset := 0
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			offset = n
+		}
+	}
+	items, err := s.DB.ListRejectedItems(limit, offset)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if items == nil {
+		items = []*model.RejectedItem{}
+	}
+	fallbacks, _ := s.DB.CountFilterFallbacks(7 * 86400)
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "filter_fallbacks": fallbacks})
+}
+
+// handleAcceptRejected creates the card a rejected item would have become
+// (auto-started) and removes the rejected row. The tuning loop for writing
+// good filter instructions.
+func (s *Server) handleAcceptRejected(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	item, err := s.DB.GetRejectedItem(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if item == nil {
+		writeErr(w, http.StatusNotFound, "rejected item not found")
+		return
+	}
+	boardID := item.BoardID
+	if boardID == "" {
+		b, err := s.DB.EnsureDefaultBoard()
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "database error")
+			return
+		}
+		boardID = b.ID
+	}
+	card, err := s.Orch.IngestCard(boardID, item.Title, item.Payload, item.Source)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not create card")
+		return
+	}
+	_ = s.DB.DeleteRejectedItem(item.ID)
+	d, _ := s.cardDetail(card)
+	writeJSON(w, http.StatusCreated, d)
 }
 
 // ---------- admin: llm providers ----------

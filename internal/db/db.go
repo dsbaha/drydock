@@ -132,6 +132,22 @@ func (d *DB) migrate() error {
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS webhook_source_filters (
+			source TEXT PRIMARY KEY,
+			filter_enabled INTEGER NOT NULL DEFAULT 0,
+			filter_instructions TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS rejected_items (
+			id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL,
+			source TEXT NOT NULL,
+			title TEXT NOT NULL,
+			reason TEXT NOT NULL DEFAULT '',
+			payload TEXT NOT NULL DEFAULT '',
+			board_id TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rejected_created ON rejected_items(created_at)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.Exec(s); err != nil {
@@ -144,6 +160,12 @@ func (d *DB) migrate() error {
 		return err
 	}
 	if err := d.ensureColumn("feeds", "last_item_at", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("feeds", "filter_enabled", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("feeds", "filter_instructions", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil

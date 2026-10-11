@@ -8,6 +8,7 @@ package ingest
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -34,6 +35,10 @@ type Service struct {
 	DB   *db.DB
 	Sink CardSink
 
+	// Filter gates inbound items behind LLM triage when the source has
+	// filtering enabled. Nil disables filtering (fail-open).
+	Filter *Filter
+
 	httpClient *http.Client
 }
 
@@ -46,9 +51,18 @@ func New(database *db.DB, sink CardSink) *Service {
 	}
 }
 
+// Outcome describes what happened to one inbound item.
+type Outcome struct {
+	Card     *model.Card // nil when rejected or filtered out
+	Accepted bool
+	Reason   string // filter verdict reason ("" when no filtering applied)
+}
+
 // Webhook handles POST /api/ingest/webhook/:source: any JSON body with a
-// title becomes a card in the default board's inbox, auto-started.
-func (s *Service) Webhook(source string, payload map[string]any) (*model.Card, error) {
+// title becomes a card in the default board's inbox, auto-started — unless
+// the source has intake filtering enabled, in which case the LLM triage
+// decides. Rejected items are recorded for later review, not dropped.
+func (s *Service) Webhook(source string, payload map[string]any) (Outcome, error) {
 	title, _ := payload["title"].(string)
 	if title == "" {
 		title, _ = payload["text"].(string)
@@ -64,9 +78,42 @@ func (s *Service) Webhook(source string, payload map[string]any) (*model.Card, e
 	}
 	board, err := s.DB.EnsureDefaultBoard()
 	if err != nil {
-		return nil, err
+		return Outcome{}, err
 	}
-	return s.Sink(board.ID, title, body, "webhook:"+source)
+	fullSource := "webhook:" + source
+	if wf, err := s.DB.EnsureWebhookFilter(fullSource); err == nil && wf.FilterEnabled && s.Filter != nil {
+		accept, reason := s.Filter.Evaluate("webhook", fullSource, title, body, wf.FilterInstructions)
+		if !accept {
+			raw, _ := json.Marshal(payload)
+			_ = s.DB.CreateRejectedItem(&model.RejectedItem{
+				ID: db.NewID(), Kind: "webhook", Source: fullSource,
+				Title: title, Reason: reason, Payload: truncateRunes(string(raw), 4000),
+				BoardID: board.ID, CreatedAt: db.Now(),
+			})
+			log.Printf("drydock: webhook %q rejected item %q: %s", source, title, reason)
+			return Outcome{Accepted: false, Reason: reason}, nil
+		}
+		return s.acceptCard(board.ID, title, body, fullSource, reason)
+	}
+	card, err := s.Sink(board.ID, title, body, fullSource)
+	if err != nil {
+		return Outcome{}, err
+	}
+	return Outcome{Card: card, Accepted: true}, nil
+}
+
+// acceptCard creates the card via the sink and records the filter verdict.
+// A fail-open verdict ("filter unavailable: ...") is logged as an event so
+// the admin UI can hint that the filter was not actually consulted.
+func (s *Service) acceptCard(boardID, title, body, source, reason string) (Outcome, error) {
+	card, err := s.Sink(boardID, title, body, source)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if strings.HasPrefix(reason, unavailablePrefix) {
+		_ = s.DB.LogEvent(card.ID, "filter", "accepted ("+reason+")")
+	}
+	return Outcome{Card: card, Accepted: true, Reason: reason}, nil
 }
 
 // ---------- RSS ----------
@@ -139,7 +186,28 @@ func (s *Service) PollFeed(feed *model.Feed) (int, error) {
 			}
 			body += it.Link
 		}
-		if _, err := s.Sink(feed.BoardID, strings.TrimSpace(it.Title), body, "rss:"+feed.Name); err != nil {
+		title := strings.TrimSpace(it.Title)
+		source := "rss:" + feed.Name
+		if feed.FilterEnabled && s.Filter != nil {
+			accept, reason := s.Filter.Evaluate("rss", source, title, body, feed.FilterInstructions)
+			_ = s.DB.FeedMarkSeen(feed.ID, guid) // seen either way: never re-triage
+			if !accept {
+				_ = s.DB.CreateRejectedItem(&model.RejectedItem{
+					ID: db.NewID(), Kind: "rss", Source: source,
+					Title: title, Reason: reason, Payload: truncateRunes(body, 4000),
+					BoardID: feed.BoardID, CreatedAt: db.Now(),
+				})
+				log.Printf("drydock: feed %q rejected item %q: %s", feed.Name, title, reason)
+				continue
+			}
+			if _, err := s.acceptCard(feed.BoardID, title, body, source, reason); err != nil {
+				log.Printf("drydock: rss card create: %v", err)
+				continue
+			}
+			created++
+			continue
+		}
+		if _, err := s.Sink(feed.BoardID, title, body, source); err != nil {
 			log.Printf("drydock: rss card create: %v", err)
 			continue
 		}
@@ -169,6 +237,8 @@ func (s *Service) PollLoop(ctx context.Context) {
 }
 
 func (s *Service) pollDue() {
+	// Opportunistic housekeeping: rejected items older than 30 days expire.
+	_ = s.DB.PruneRejectedItems(30 * 86400)
 	feeds, err := s.DB.ListFeeds()
 	if err != nil {
 		return

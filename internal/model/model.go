@@ -106,20 +106,38 @@ type Event struct {
 
 // Feed is a configured RSS source polled by the ingestor.
 type Feed struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	URL          string `json:"url"`
-	BoardID      string `json:"board_id"`
-	IntervalSec  int    `json:"interval_sec"`
-	LastPolledAt int64  `json:"last_polled_at"`
-	LastItemAt   int64  `json:"last_item_at"` // last poll that produced a card
-	CreatedAt    int64  `json:"created_at"`
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	URL               string `json:"url"`
+	BoardID           string `json:"board_id"`
+	IntervalSec       int    `json:"interval_sec"`
+	LastPolledAt      int64  `json:"last_polled_at"`
+	LastItemAt        int64  `json:"last_item_at"` // last poll that produced a card
+	FilterEnabled     bool   `json:"filter_enabled"`
+	FilterInstructions string `json:"filter_instructions"`
+	CreatedAt         int64  `json:"created_at"`
 }
 
 // WebhookSource is one distinct webhook :source seen in cards, with its card count.
 type WebhookSource struct {
-	Source string `json:"source"`
-	Count  int    `json:"count"`
+	Source             string `json:"source"`
+	Count              int    `json:"count"`
+	FilterEnabled      bool   `json:"filter_enabled"`
+	FilterInstructions string `json:"filter_instructions"`
+}
+
+// RejectedItem is an inbound item the intake filter declined. Kept for 30
+// days so filter instructions can be tuned; an admin can accept one anyway,
+// which creates the card it would have become.
+type RejectedItem struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"` // "rss" | "webhook"
+	Source    string `json:"source"`
+	Title     string `json:"title"`
+	Reason    string `json:"reason"`
+	Payload   string `json:"payload"` // item body (truncated)
+	BoardID   string `json:"board_id"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 // LLMProvider is an admin-configured LLM service agents can use.

@@ -58,6 +58,9 @@ func main() {
 	orch := agents.New(database, dockerClient, cfg.DefaultImage, cfg.AgentRuntime, srv)
 	srv.Orch = orch
 	srv.Ing = ingest.New(database, orch.IngestCard)
+	// LLM intake filtering for RSS/webhook sources with filtering enabled.
+	// Fail-open: sources without a filter, or filter failures, still ingest.
+	srv.Ing.Filter = &ingest.Filter{Classify: &ingest.LLMClassifier{DB: database}}
 
 	// Seed the default board so ingestion and manual cards work immediately.
 	if _, err := database.EnsureDefaultBoard(); err != nil {

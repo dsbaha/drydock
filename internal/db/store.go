@@ -428,13 +428,28 @@ func (d *DB) ListEvents(cardID string, limit int) ([]*model.Event, error) {	rows
 // ---------- feeds ----------
 
 func (d *DB) CreateFeed(f *model.Feed) error {
-	_, err := d.Exec(`INSERT INTO feeds (id, name, url, board_id, interval_sec, last_polled_at, created_at)
-		VALUES (?, ?, ?, ?, ?, 0, ?)`, f.ID, f.Name, f.URL, f.BoardID, f.IntervalSec, f.CreatedAt)
+	_, err := d.Exec(`INSERT INTO feeds (id, name, url, board_id, interval_sec, last_polled_at, filter_enabled, filter_instructions, created_at)
+		VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`, f.ID, f.Name, f.URL, f.BoardID, f.IntervalSec, boolInt(f.FilterEnabled), f.FilterInstructions, f.CreatedAt)
 	return err
 }
 
+func scanFeed(row interface {
+	Scan(dest ...any) error
+}) (*model.Feed, error) {
+	f := &model.Feed{}
+	var enabled int
+	err := row.Scan(&f.ID, &f.Name, &f.URL, &f.BoardID, &f.IntervalSec, &f.LastPolledAt, &f.LastItemAt,
+		&enabled, &f.FilterInstructions, &f.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	f.FilterEnabled = enabled != 0
+	return f, nil
+}
+
 func (d *DB) ListFeeds() ([]*model.Feed, error) {
-	rows, err := d.Query(`SELECT id, name, url, board_id, interval_sec, last_polled_at, last_item_at, created_at
+	rows, err := d.Query(`SELECT id, name, url, board_id, interval_sec, last_polled_at, last_item_at,
+		filter_enabled, filter_instructions, created_at
 		FROM feeds ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -442,8 +457,8 @@ func (d *DB) ListFeeds() ([]*model.Feed, error) {
 	defer rows.Close()
 	var out []*model.Feed
 	for rows.Next() {
-		f := &model.Feed{}
-		if err := rows.Scan(&f.ID, &f.Name, &f.URL, &f.BoardID, &f.IntervalSec, &f.LastPolledAt, &f.LastItemAt, &f.CreatedAt); err != nil {
+		f, err := scanFeed(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
@@ -452,14 +467,20 @@ func (d *DB) ListFeeds() ([]*model.Feed, error) {
 }
 
 func (d *DB) GetFeed(id string) (*model.Feed, error) {
-	f := &model.Feed{}
-	err := d.QueryRow(`SELECT id, name, url, board_id, interval_sec, last_polled_at, last_item_at, created_at
-		FROM feeds WHERE id = ?`, id).
-		Scan(&f.ID, &f.Name, &f.URL, &f.BoardID, &f.IntervalSec, &f.LastPolledAt, &f.LastItemAt, &f.CreatedAt)
+	f, err := scanFeed(d.QueryRow(`SELECT id, name, url, board_id, interval_sec, last_polled_at, last_item_at,
+		filter_enabled, filter_instructions, created_at
+		FROM feeds WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	return f, err
+}
+
+// UpdateFeedFilter sets a feed's intake-filter toggle and instructions.
+func (d *DB) UpdateFeedFilter(id string, enabled bool, instructions string) error {
+	_, err := d.Exec(`UPDATE feeds SET filter_enabled = ?, filter_instructions = ? WHERE id = ?`,
+		boolInt(enabled), instructions, id)
+	return err
 }
 
 func (d *DB) DeleteFeed(id string) error {
@@ -479,10 +500,13 @@ func (d *DB) SetFeedLastItem(id string, at int64) error {
 }
 
 // WebhookSources lists the distinct webhook :source names seen in cards,
-// with their card counts, for the admin UI.
+// with their card counts, for the admin UI. Filter settings are joined in
+// (a source with no filter row yet reports disabled/empty).
 func (d *DB) WebhookSources() ([]*model.WebhookSource, error) {
-	rows, err := d.Query(`SELECT source, COUNT(*) FROM cards
-		WHERE source LIKE 'webhook:%' GROUP BY source ORDER BY COUNT(*) DESC`)
+	rows, err := d.Query(`SELECT c.source, COUNT(*),
+			COALESCE(f.filter_enabled, 0), COALESCE(f.filter_instructions, '')
+		FROM cards c LEFT JOIN webhook_source_filters f ON f.source = c.source
+		WHERE c.source LIKE 'webhook:%' GROUP BY c.source ORDER BY COUNT(*) DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -490,12 +514,105 @@ func (d *DB) WebhookSources() ([]*model.WebhookSource, error) {
 	var out []*model.WebhookSource
 	for rows.Next() {
 		ws := &model.WebhookSource{}
-		if err := rows.Scan(&ws.Source, &ws.Count); err != nil {
+		var enabled int
+		if err := rows.Scan(&ws.Source, &ws.Count, &enabled, &ws.FilterInstructions); err != nil {
 			return nil, err
 		}
+		ws.FilterEnabled = enabled != 0
 		out = append(out, ws)
 	}
 	return out, rows.Err()
+}
+
+// EnsureWebhookFilter returns the filter row for a webhook source, creating
+// it disabled when first seen.
+func (d *DB) EnsureWebhookFilter(source string) (*model.WebhookSource, error) {
+	if _, err := d.Exec(`INSERT OR IGNORE INTO webhook_source_filters (source) VALUES (?)`, source); err != nil {
+		return nil, err
+	}
+	ws := &model.WebhookSource{Source: source}
+	var enabled int
+	err := d.QueryRow(`SELECT filter_enabled, filter_instructions FROM webhook_source_filters WHERE source = ?`, source).
+		Scan(&enabled, &ws.FilterInstructions)
+	if err != nil {
+		return nil, err
+	}
+	ws.FilterEnabled = enabled != 0
+	return ws, nil
+}
+
+// SetWebhookFilter upserts a webhook source's intake-filter toggle and instructions.
+func (d *DB) SetWebhookFilter(source string, enabled bool, instructions string) error {
+	_, err := d.Exec(`INSERT INTO webhook_source_filters (source, filter_enabled, filter_instructions)
+		VALUES (?, ?, ?)
+		ON CONFLICT(source) DO UPDATE SET filter_enabled = excluded.filter_enabled,
+			filter_instructions = excluded.filter_instructions`,
+		source, boolInt(enabled), instructions)
+	return err
+}
+
+// ---------- rejected items ----------
+
+// CreateRejectedItem records an inbound item the intake filter declined.
+func (d *DB) CreateRejectedItem(it *model.RejectedItem) error {
+	_, err := d.Exec(`INSERT INTO rejected_items (id, kind, source, title, reason, payload, board_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		it.ID, it.Kind, it.Source, it.Title, it.Reason, it.Payload, it.BoardID, it.CreatedAt)
+	return err
+}
+
+// ListRejectedItems returns rejected items newest-first.
+func (d *DB) ListRejectedItems(limit, offset int) ([]*model.RejectedItem, error) {
+	rows, err := d.Query(`SELECT id, kind, source, title, reason, payload, board_id, created_at
+		FROM rejected_items ORDER BY created_at DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.RejectedItem
+	for rows.Next() {
+		it := &model.RejectedItem{}
+		if err := rows.Scan(&it.ID, &it.Kind, &it.Source, &it.Title, &it.Reason, &it.Payload, &it.BoardID, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// GetRejectedItem fetches one rejected item.
+func (d *DB) GetRejectedItem(id string) (*model.RejectedItem, error) {
+	it := &model.RejectedItem{}
+	err := d.QueryRow(`SELECT id, kind, source, title, reason, payload, board_id, created_at
+		FROM rejected_items WHERE id = ?`, id).
+		Scan(&it.ID, &it.Kind, &it.Source, &it.Title, &it.Reason, &it.Payload, &it.BoardID, &it.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return it, err
+}
+
+// DeleteRejectedItem removes a rejected item (e.g. after accept-anyway).
+func (d *DB) DeleteRejectedItem(id string) error {
+	_, err := d.Exec(`DELETE FROM rejected_items WHERE id = ?`, id)
+	return err
+}
+
+// PruneRejectedItems deletes rejected items older than olderThanSec seconds.
+func (d *DB) PruneRejectedItems(olderThanSec int64) error {
+	_, err := d.Exec(`DELETE FROM rejected_items WHERE created_at < ?`, Now()-olderThanSec)
+	return err
+}
+
+// CountFilterFallbacks counts distinct cards in the last windowSec seconds
+// whose intake filter was unavailable (fail-open accepts). Powers the admin
+// hint that tells the user to configure an LLM provider.
+func (d *DB) CountFilterFallbacks(windowSec int64) (int, error) {
+	var n int
+	err := d.QueryRow(`SELECT COUNT(DISTINCT card_id) FROM events
+		WHERE kind = 'filter' AND payload LIKE 'accepted (filter unavailable:%'
+		AND created_at > ?`, Now()-windowSec).Scan(&n)
+	return n, err
 }
 
 func (d *DB) FeedSeenGUID(feedID, guid string) (bool, error) {

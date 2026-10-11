@@ -17,7 +17,11 @@ ingestion → inbox → working → needs_you → qa → done
 1. **Ingestion.** Pluggable connectors create cards: `POST
    /api/ingest/webhook/:source`, RSS feeds (admin-configured, polled,
    deduped by guid), or manual creation. New cards land in the **inbox** and
-   **auto-start** — no triage gate.
+   **auto-start** — no triage gate — unless the source has **LLM intake
+   filtering** enabled: then each item is triaged by an LLM against the
+   source's intake instructions, and only accepted items become cards.
+   Rejected items are kept for 30 days in Admin → Rejected items, where you
+   can tune instructions or accept one anyway.
 2. **Working.** Each card gets a Docker container (named volume
    `drydock-card-<id>`, kept across restarts) and a worker agent runtime
    (`pi`, `zot`, …). The agent decomposes the task into steps — reusing the
@@ -70,13 +74,26 @@ Cards: `GET /api/cards/:id`, `POST /api/cards/:id/messages`,
 `POST /api/cards/:id/answer`, `POST /api/cards/:id/move`,
 `POST /api/cards/:id/sendback`, `POST /api/cards/:id/stop`
 Ingest: `POST /api/ingest/webhook/:source`
-Admin: `GET/POST/DELETE /api/admin/feeds`, `GET/POST/DELETE /api/admin/providers`
+Admin: `GET/POST/DELETE /api/admin/feeds`, `PUT /api/admin/feeds/:id`,
+`GET /api/admin/webhook-sources`, `PUT /api/admin/webhook-sources/:source`,
+`GET /api/admin/rejected`, `POST /api/admin/rejected/:id/accept`,
+`GET/POST/DELETE /api/admin/providers`
 Live: `GET /api/stream` (board events), `GET /api/cards/:id/chat` (per-card chat)
 
 ## Design decisions
 
-- **Auto-start, no triage.** Ingested cards begin working immediately; the
-  alarm badge + QA column are the control points, not an approval queue.
+- **Auto-start, with optional LLM triage.** Ingested cards begin working
+  immediately; the alarm badge + QA column are the control points, not an
+  approval queue. Sources that need it (e.g. noisy email/RSS) can enable
+  **intake filtering**: an LLM triages each item against the source's
+  instructions and only accepted items become cards.
+- **Filter is fail-open.** No provider configured, provider error, or an
+  unparseable verdict all *accept* the item with a `filter unavailable`
+  reason — inbound work is never silently dropped. The Admin → Rejected
+  view shows a hint when recent cards were accepted this way.
+- **Rejected items are reviewable.** Declined items are kept 30 days with
+  the filter's reason; accepting one anyway creates + auto-starts its card.
+  This is the tuning loop for writing good intake instructions.
 - **Steps are the progress bar.** The % badge is always `done/total` steps —
   runtimes report step completions, they don't invent percentages.
 - **History-driven planning.** New cards clone the step plan of the most
