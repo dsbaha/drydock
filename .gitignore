@@ -1,0 +1,8 @@
+# Built binary (anchored: a bare "drydock" would also ignore a source dir
+# of the same name — lesson learned on TermDock).
+/drydock
+/dist/
+/data/
+*.db
+*.db-wal
+*.db-shm

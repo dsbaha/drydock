@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drydock</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+
+<!-- ============ AUTH VIEW ============ -->
+<div id="auth-view" class="auth-view hidden">
+  <div class="auth-card">
+    <h1>Drydock</h1>
+    <p class="tagline">Agentic kanban — every card gets a container and a coding agent.</p>
+    <div class="auth-tabs">
+      <button id="tab-login" class="auth-tab active">Log in</button>
+      <button id="tab-register" class="auth-tab">Register</button>
+    </div>
+    <form id="login-form" class="auth-form">
+      <input id="login-username" type="text" placeholder="Username" autocomplete="username" required>
+      <input id="login-password" type="password" placeholder="Password" autocomplete="current-password" required>
+      <button type="submit" class="btn primary full">Log in</button>
+    </form>
+    <form id="register-form" class="auth-form hidden">
+      <input id="register-username" type="text" placeholder="Username" autocomplete="username" required>
+      <input id="register-password" type="password" placeholder="Password (min 8 chars)" autocomplete="new-password" required>
+      <button type="submit" class="btn primary full">Create account</button>
+    </form>
+    <p id="auth-error" class="error hidden"></p>
+  </div>
+</div>
+
+<!-- ============ APP VIEW ============ -->
+<div id="app-view" class="hidden">
+  <header class="topbar">
+    <div class="brand">Drydock</div>
+    <span id="live-dot" class="live-dot" title="Live event stream: green = connected, amber = reconnecting"></span>
+    <select id="board-select" title="Board"></select>
+    <button id="new-board-btn" class="btn ghost small">+ Board</button>
+    <div class="spacer"></div>
+    <button id="new-card-btn" class="btn primary small">+ New card</button>
+    <span id="user-label" class="user-label"></span>
+    <button id="logout-btn" class="btn ghost">Log out</button>
+  </header>
+
+  <div class="layout">
+    <main class="board-wrap">
+      <div id="board" class="board"></div>
+      <div id="board-empty" class="empty-state hidden">
+        <h2>No boards yet</h2>
+        <p>Create a board to start collecting cards.</p>
+      </div>
+    </main>
+
+    <aside id="drawer" class="drawer hidden">
+      <div class="drawer-head">
+        <button id="drawer-close" class="btn ghost small" title="Close">✕</button>
+        <span class="drawer-label">Card</span>
+        <div class="spacer"></div>
+        <select id="drawer-move" title="Move to column">
+          <option value="inbox">Inbox</option>
+          <option value="working">Working</option>
+          <option value="needs_you">Needs You</option>
+          <option value="qa">QA</option>
+          <option value="done">Done</option>
+        </select>
+      </div>
+      <div id="drawer-body" class="drawer-body"></div>
+    </aside>
+  </div>
+</div>
+
+<!-- ============ NEW CARD MODAL ============ -->
+<div id="card-modal" class="modal hidden">
+  <div class="modal-card">
+    <h2>New card</h2>
+    <form id="card-form">
+      <label>Title
+        <input id="nc-title" type="text" placeholder="What should the agent work on?" maxlength="200" required>
+      </label>
+      <label>Body
+        <textarea id="nc-body" rows="6" placeholder="Details, acceptance criteria, context…" spellcheck="false"></textarea>
+      </label>
+      <div class="modal-actions">
+        <button type="button" id="nc-cancel" class="btn ghost">Cancel</button>
+        <button type="submit" class="btn primary">Create</button>
+      </div>
+    </form>
+    <p id="nc-error" class="error hidden"></p>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
