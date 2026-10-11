@@ -20,6 +20,7 @@ import (
 	"github.com/dsbaha/drydock/internal/config"
 	"github.com/dsbaha/drydock/internal/db"
 	"github.com/dsbaha/drydock/internal/dockerx"
+	"github.com/dsbaha/drydock/internal/flows"
 	"github.com/dsbaha/drydock/internal/ingest"
 	"github.com/dsbaha/drydock/internal/server"
 	"github.com/dsbaha/drydock/web"
@@ -57,10 +58,20 @@ func main() {
 	srv := &server.Server{DB: database, Auth: authH, Hub: server.NewHub()}
 	orch := agents.New(database, dockerClient, cfg.DefaultImage, cfg.AgentRuntime, srv)
 	srv.Orch = orch
-	srv.Ing = ingest.New(database, orch.IngestCard)
+	// The flow engine owns card creation: inbound items (and the manual
+	// "New card" button) enter the board's flow, whose worker node creates
+	// the card via the orchestrator. The default flow reproduces the
+	// previous hardcoded pipeline exactly.
+	flowEngine := flows.New(database, orch.IngestCardWithOptions, nil /* classifier wired below */)
+	srv.Flows = flowEngine
+	srv.Ing = ingest.New(database, func(boardID, kind, title, body, source string) (*flows.Result, error) {
+		return flowEngine.TriggerInbox(boardID, kind, title, body, source)
+	})
 	// LLM intake filtering for RSS/webhook sources with filtering enabled.
 	// Fail-open: sources without a filter, or filter failures, still ingest.
 	srv.Ing.Filter = &ingest.Filter{Classify: &ingest.LLMClassifier{DB: database}}
+	// The same classifier backs flow-level llm_filter nodes.
+	flowEngine.SetClassifier(srv.Ing.Filter)
 
 	// Seed the default board so ingestion and manual cards work immediately.
 	if _, err := database.EnsureDefaultBoard(); err != nil {

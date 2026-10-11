@@ -183,6 +183,26 @@ func (d *DB) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_wiki_proposals_status ON wiki_proposals(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_wiki_proposals_board ON wiki_proposals(board_id)`,
+		`CREATE TABLE IF NOT EXISTS flows (
+			id TEXT PRIMARY KEY,
+			board_id TEXT NOT NULL UNIQUE REFERENCES boards(id) ON DELETE CASCADE,
+			name TEXT NOT NULL DEFAULT 'Main flow',
+			definition TEXT NOT NULL DEFAULT '',
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS flow_runs (
+			id TEXT PRIMARY KEY,
+			flow_id TEXT NOT NULL,
+			board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+			status TEXT NOT NULL DEFAULT 'ok',
+			detail TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_flow_runs_board ON flow_runs(board_id, created_at)`,
+		`CREATE TABLE IF NOT EXISTS flow_hooks (
+			card_id TEXT PRIMARY KEY,
+			url TEXT NOT NULL
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.Exec(s); err != nil {
@@ -211,6 +231,9 @@ func (d *DB) migrate() error {
 		return err
 	}
 	if err := d.ensureColumn("boards", "instructions", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("cards", "skip_verify", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	return nil

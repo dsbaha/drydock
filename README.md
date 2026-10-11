@@ -127,6 +127,18 @@ Live: `GET /api/stream` (board events), `GET /api/cards/:id/chat` (per-card chat
   (a done card reopened between scan and prune gets a fresh volume under the
   same name, which must not be touched) and deletes exactly the checked
   names, best-effort per volume.
+- **Flows: the pipeline is visual.** Each board owns one Node-RED-style
+  flow (hand-rolled SVG editor, no dependencies) that controls how inbound
+  items travel through LLMs to outputs. The previous hardcoded pipeline is
+  the seeded *default flow* (`inbox → worker`, `manual → worker`), so
+  behavior is unchanged until a board customizes it. Node palette v1:
+  `inbox` / `manual` inputs, `llm_filter` (accept/reject ports, rejects go
+  to the Rejected queue), `llm` (prompt templates with
+  `{{title}}`/`{{body}}`/`{{var:name}}`, output to body or a var), `worker`
+  (card creation + autostart, optional runtime override and verify toggle),
+  `notify` (webhook POST on card close). The engine compiles (cycle/port/
+  config validation), walks the DAG synchronously per item, and logs every
+  run for observability. See `docs/flows.md`.
 - **Single static binary**, `go:embed` UI, SQLite (WAL), no CGO — same
   deployment story as TermDock.
 - **Instructions layer.** Global working instructions plus per-board

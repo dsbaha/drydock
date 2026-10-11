@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/dsbaha/drydock/internal/db"
+	"github.com/dsbaha/drydock/internal/flows"
 	"github.com/dsbaha/drydock/internal/model"
 )
 
@@ -76,10 +77,10 @@ func testDB(t *testing.T) *db.DB {
 func testService(t *testing.T, database *db.DB) (*Service, *[]*model.Card) {
 	t.Helper()
 	var cards []*model.Card
-	sink := func(boardID, title, body, source string) (*model.Card, error) {
+	sink := func(boardID, kind, title, body, source string) (*flows.Result, error) {
 		c := &model.Card{ID: db.NewID(), BoardID: boardID, Title: title, Body: body, Source: source}
 		cards = append(cards, c)
-		return c, nil
+		return &flows.Result{Card: c}, nil
 	}
 	return New(database, sink), &cards
 }

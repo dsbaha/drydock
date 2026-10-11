@@ -40,6 +40,7 @@
     <nav class="view-nav">
       <button id="nav-board" class="btn ghost small active">Board</button>
       <button id="nav-wiki" class="btn ghost small">Wiki</button>
+      <button id="nav-flows" class="btn ghost small">Flows</button>
       <button id="nav-admin" class="btn ghost small hidden">Admin<span id="nav-admin-badge" class="nav-badge hidden"></span></button>
     </nav>
     <select id="board-select" title="Board"></select>
@@ -173,6 +174,36 @@
         <div id="wiki-history" class="hidden"></div>
       </article>
     </main>
+  </div>
+
+  <div class="layout hidden" id="flows-view">
+    <aside class="flow-palette">
+      <span class="drawer-label">Nodes</span>
+      <p class="muted small">Click a node to add it to the canvas. Drag nodes to move them, drag from an output port to an input port to wire them, click a wire to delete it.</p>
+      <div id="flow-palette-items"></div>
+      <span class="drawer-label" style="margin-top:14px">Flow</span>
+      <div class="admin-row">
+        <button id="flow-save" class="btn primary small">Save</button>
+        <button id="flow-reset" class="btn small">Reset to default</button>
+      </div>
+      <p id="flow-error" class="error hidden"></p>
+      <div id="flow-validation" class="flow-validation"></div>
+      <div id="flow-runs-wrap" class="hidden">
+        <span class="drawer-label" style="margin-top:14px">Recent runs</span>
+        <div id="flow-runs"></div>
+      </div>
+    </aside>
+    <main class="flow-main">
+      <svg id="flow-canvas" aria-label="Flow canvas"></svg>
+    </main>
+    <aside class="flow-config hidden" id="flow-config">
+      <div class="flow-config-head">
+        <span class="drawer-label">Node</span>
+        <div class="spacer"></div>
+        <button id="flow-config-close" class="btn ghost small" title="Close">✕</button>
+      </div>
+      <div id="flow-config-body"></div>
+    </aside>
   </div>
 
   <div class="layout" id="board-view">

@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/dsbaha/drydock/internal/db"
 	"github.com/dsbaha/drydock/internal/dockerx"
+	"github.com/dsbaha/drydock/internal/flows"
 	"github.com/dsbaha/drydock/internal/model"
 )
 
@@ -99,11 +101,35 @@ func (o *Orchestrator) newRuntime(name string) Runtime {
 	return NewEchoRuntime(0)
 }
 
+// RuntimeNames lists the registered agent runtime names for the flow
+// editor's worker-node config.
+func (o *Orchestrator) RuntimeNames() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	names := make([]string, 0, len(o.registry))
+	for n := range o.registry {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // ---------- ingestion ----------
 
 // IngestCard creates a card in the inbox and auto-starts it.
 func (o *Orchestrator) IngestCard(boardID, title, body, source string) (*model.Card, error) {
+	return o.IngestCardWithOptions(boardID, title, body, source, "", false)
+}
+
+// IngestCardWithOptions creates a card in the inbox and auto-starts it,
+// honoring a flow worker node's runtime override and verify=false (skip the
+// QA pass when the worker finishes).
+func (o *Orchestrator) IngestCardWithOptions(boardID, title, body, source, runtime string, skipVerify bool) (*model.Card, error) {
 	now := db.Now()
+	rt := runtime
+	if rt == "" {
+		rt = o.DefaultRuntime
+	}
 	card := &model.Card{
 		ID:           db.NewID(),
 		BoardID:      boardID,
@@ -111,7 +137,8 @@ func (o *Orchestrator) IngestCard(boardID, title, body, source string) (*model.C
 		Body:         body,
 		Source:       source,
 		Column:       model.ColInbox,
-		AgentRuntime: o.DefaultRuntime,
+		AgentRuntime: rt,
+		SkipVerify:   skipVerify,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -247,7 +274,12 @@ func (o *Orchestrator) runWorker(cardID string) {
 			_ = o.DB.SetCardColumn(cardID, model.ColNeedsYou)
 			o.refreshNotify(cardID, "updated")
 		case done:
-			o.MoveToQA(cardID)
+			// A flow worker node with verify=false skips the QA pass.
+			if c, _ := o.DB.GetCard(cardID); c != nil && c.SkipVerify {
+				o.MoveToDone(cardID)
+			} else {
+				o.MoveToQA(cardID)
+			}
 		}
 	}()
 }
@@ -547,8 +579,9 @@ func (o *Orchestrator) MoveToDone(cardID string) {
 	// Archive the full transcript first: chat, steps, questions and events
 	// already live in the database, and this snapshot keeps the done card
 	// self-contained even if those tables are pruned later.
-	if t := o.buildTranscript(cardID); t != "" {
-		_ = o.DB.SetCardTranscript(cardID, t)
+	transcript := o.buildTranscript(cardID)
+	if transcript != "" {
+		_ = o.DB.SetCardTranscript(cardID, transcript)
 	}
 	o.stopRun(cardID)
 	detail := o.teardownCard(cardID)
@@ -557,6 +590,8 @@ func (o *Orchestrator) MoveToDone(cardID string) {
 	_ = o.DB.SetCardProgress(cardID, 100)
 	_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: cardID,
 		From: model.FromSystem, Text: "Container and volume removed.", CreatedAt: db.Now()})
+	// Notify-on-close flow hooks (best-effort; the hook row is consumed).
+	flows.FireCloseHooks(context.Background(), o.DB, card, transcript)
 	o.refreshNotify(cardID, "moved")
 }
 

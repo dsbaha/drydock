@@ -163,20 +163,24 @@ function showView(which) {
   state.view = which;
   const admin = which === "admin";
   const wiki = which === "wiki";
-  $("board-view").classList.toggle("hidden", admin || wiki);
+  const flows = which === "flows";
+  $("board-view").classList.toggle("hidden", admin || wiki || flows);
   $("wiki-view").classList.toggle("hidden", !wiki);
   $("admin-view").classList.toggle("hidden", !admin);
+  $("flows-view").classList.toggle("hidden", !flows);
   $("nav-board").classList.toggle("active", which === "board");
   $("nav-wiki").classList.toggle("active", wiki);
+  $("nav-flows").classList.toggle("active", flows);
   $("nav-admin").classList.toggle("active", admin);
-  // Board controls don't apply to the admin view; the wiki view keeps the
-  // board picker (wiki is per-board) but hides the action buttons.
+  // Board controls don't apply to the admin view; the wiki and flows views
+  // keep the board picker (both are per-board) but hide the action buttons.
   for (const id of ["new-board-btn", "new-card-btn"]) {
-    $(id).classList.toggle("hidden", admin || wiki);
+    $(id).classList.toggle("hidden", admin || wiki || flows);
   }
   $("board-select").classList.toggle("hidden", admin);
   if (admin) loadAdmin();
   if (wiki) loadWiki();
+  if (flows) loadFlow();
 }
 
 async function loadBoards() {
@@ -1834,6 +1838,7 @@ function init() {
   });
   $("nav-board").addEventListener("click", () => showView("board"));
   $("nav-wiki").addEventListener("click", () => showView("wiki"));
+  $("nav-flows").addEventListener("click", () => showView("flows"));
   $("nav-admin").addEventListener("click", () => showView("admin"));
   $("board-select").addEventListener("change", (e) => {
     state.boardId = e.target.value;
@@ -1841,6 +1846,8 @@ function init() {
     if (state.view === "wiki") {
       state.wikiPageId = null;
       loadWiki();
+    } else if (state.view === "flows") {
+      loadFlow();
     } else {
       loadBoard();
     }
@@ -1927,6 +1934,7 @@ function init() {
   $("provider-form").addEventListener("submit", submitProvider);
   $("webhook-copy").addEventListener("click", copyWebhookUrl);
   $("volumes-scan").addEventListener("click", scanVolumes);
+  flowBindUI();
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       closeCardModal();
@@ -1946,3 +1954,569 @@ function init() {
 }
 
 init();
+
+/* ---------------- flows editor ---------------- */
+// Node-RED-style visual pipeline builder. Dependency-free SVG canvas:
+// click palette to add nodes, drag nodes to move, drag output→input ports
+// to wire, click a wire to delete it, drag the background to pan.
+
+const FLOW_TYPES = [
+  { type: "inbox", label: "Inbox", cat: "input", desc: "Item accepted by intake filtering" },
+  { type: "manual", label: "Manual", cat: "input", desc: "\u201cNew card\u201d button" },
+  { type: "llm_filter", label: "LLM filter", cat: "processor", desc: "Triage with the LLM" },
+  { type: "llm", label: "LLM", cat: "processor", desc: "Transform with the LLM" },
+  { type: "worker", label: "Worker", cat: "processor", desc: "Create card + start agent" },
+  { type: "notify", label: "Notify", cat: "output", desc: "Webhook on card close" },
+];
+const FLOW_PORTS = {
+  inbox: [[], ["out"]],
+  manual: [[], ["out"]],
+  llm_filter: [["in"], ["accept", "reject"]],
+  llm: [["in"], ["out"]],
+  worker: [["in"], ["out"]], // out is optional: fires after the card is created
+  notify: [["in"], []],
+};
+const FLOW_NODE_W = 180;
+const FLOW_NODE_H = 78;
+
+const flowEd = {
+  nodes: new Map(),
+  edges: [],
+  selected: null,
+  pan: { x: 24, y: 24 },
+  drag: null,   // {kind:"node"|"pan"|"link", ...}
+  moved: false, // pointer traveled: suppress click actions
+  nextNum: 1,
+  runtimes: [],
+  readonly: true,
+};
+
+function flowTypeLabel(t) {
+  const f = FLOW_TYPES.find((x) => x.type === t);
+  return f ? f.label : t;
+}
+
+function flowSummary(n) {
+  const cfg = n.config || {};
+  const s = (v) => (v || "").toString().trim();
+  switch (n.type) {
+    case "inbox": return "accepted intake items";
+    case "manual": return "\u201cNew card\u201d button";
+    case "llm_filter": return s(cfg.instructions) ? s(cfg.instructions).slice(0, 42) : "no instructions set";
+    case "llm": {
+      const out = s(cfg.output) || "body";
+      return "\u2192 " + out;
+    }
+    case "worker": {
+      const rt = s(cfg.runtime) || "default";
+      const v = cfg.verify === false ? "verify off" : "verify on";
+      return rt + " \u00b7 " + v;
+    }
+    case "notify": return s(cfg.url) || "no URL set";
+    default: return "";
+  }
+}
+
+function flowIsAdmin() {
+  return !!(state.user && state.user.is_admin);
+}
+
+/* ----- loading ----- */
+
+async function loadFlow() {
+  if (!state.boardId) return;
+  flowEd.readonly = !flowIsAdmin();
+  hideError("flow-error");
+  try {
+    const f = await api("/api/boards/" + encodeURIComponent(state.boardId) + "/flow");
+    const def = JSON.parse(f.definition || '{"nodes":[],"edges":[]}');
+    flowEd.nodes = new Map(
+      (def.nodes || []).map((n) => [n.id, { id: n.id, type: n.type, x: +n.x || 0, y: +n.y || 0, config: n.config || {} }])
+    );
+    flowEd.edges = def.edges || [];
+    flowEd.selected = null;
+    flowEd.pan = { x: 24, y: 24 };
+    flowEd.nextNum = flowEd.nodes.size + 1;
+    if (!flowEd.readonly) {
+      try {
+        flowEd.runtimes = (await api("/api/admin/runtimes")) || [];
+      } catch { flowEd.runtimes = []; }
+    }
+    flowRenderPalette();
+    flowRender();
+    flowRenderConfig();
+    flowValidateRender();
+    if (!flowEd.readonly) {
+      $("flow-runs-wrap").classList.remove("hidden");
+      flowLoadRuns();
+    } else {
+      $("flow-runs-wrap").classList.add("hidden");
+    }
+    // Read-only mode: hide editing affordances.
+    $("flow-palette-items").classList.toggle("hidden", flowEd.readonly);
+    for (const id of ["flow-save", "flow-reset"]) {
+      $(id).classList.toggle("hidden", flowEd.readonly);
+    }
+  } catch (e) {
+    if (e.message !== "unauthorized") showError("flow-error", "Could not load flow: " + e.message);
+  }
+}
+
+async function flowLoadRuns() {
+  try {
+    const runs = (await api("/api/admin/flow-runs?board_id=" + encodeURIComponent(state.boardId))) || [];
+    const wrap = $("flow-runs");
+    wrap.innerHTML = "";
+    if (runs.length === 0) {
+      wrap.innerHTML = '<p class="muted small">No runs yet.</p>';
+      return;
+    }
+    for (const r of runs.slice(0, 20)) {
+      const div = document.createElement("div");
+      div.className = "flow-run";
+      const pill = document.createElement("span");
+      pill.className = "flow-run-status " + r.status;
+      pill.textContent = r.status;
+      const det = document.createElement("span");
+      det.className = "flow-run-detail";
+      det.textContent = r.detail || "";
+      det.title = r.detail || "";
+      const ts = document.createElement("span");
+      ts.className = "muted small";
+      ts.textContent = timeAgo(r.created_at);
+      div.append(pill, det, ts);
+      wrap.appendChild(div);
+    }
+  } catch { /* non-fatal */ }
+}
+
+/* ----- palette ----- */
+
+function flowRenderPalette() {
+  const wrap = $("flow-palette-items");
+  wrap.innerHTML = "";
+  for (const t of FLOW_TYPES) {
+    const b = document.createElement("button");
+    b.className = "btn small flow-palette-btn cat-" + t.cat;
+    b.innerHTML = "<strong></strong><span></span>";
+    b.querySelector("strong").textContent = t.label;
+    b.querySelector("span").textContent = t.desc;
+    b.title = "Add " + t.label + " node";
+    b.addEventListener("click", () => flowAddNode(t.type));
+    wrap.appendChild(b);
+  }
+}
+
+function flowAddNode(type) {
+  const id = "n" + flowEd.nextNum++;
+  const k = flowEd.nodes.size % 5;
+  flowEd.nodes.set(id, { id, type, x: 120 + k * 44, y: 120 + k * 44, config: defaultNodeConfig(type) });
+  flowSelect(id);
+  flowRender();
+  flowValidateRender();
+}
+
+function defaultNodeConfig(type) {
+  switch (type) {
+    case "worker": return { runtime: "", verify: true };
+    case "llm": return { prompt: "", output: "body" };
+    case "llm_filter": return { instructions: "" };
+    case "notify": return { url: "" };
+    default: return {};
+  }
+}
+
+/* ----- canvas rendering ----- */
+
+function svgPoint(evt) {
+  const svg = $("flow-canvas");
+  const pt = svg.createSVGPoint();
+  pt.x = evt.clientX;
+  pt.y = evt.clientY;
+  return pt.matrixTransform(svg.getScreenCTM().inverse());
+}
+
+function flowPortPos(n, port, kind) {
+  const outs = FLOW_PORTS[n.type][1];
+  if (kind === "in") return { x: n.x, y: n.y + 44 };
+  const i = Math.max(0, outs.indexOf(port));
+  const y = outs.length === 1 ? n.y + 44 : n.y + 30 + i * 28;
+  return { x: n.x + FLOW_NODE_W, y };
+}
+
+function flowEdgePath(p1, p2) {
+  const dx = Math.max(40, Math.abs(p2.x - p1.x) / 2);
+  return `M ${p1.x} ${p1.y} C ${p1.x + dx} ${p1.y}, ${p2.x - dx} ${p2.y}, ${p2.x} ${p2.y}`;
+}
+
+function esc(s) {
+  return (s || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function flowNodeHTML(n) {
+  const t = FLOW_TYPES.find((x) => x.type === n.type) || { label: n.type, cat: "processor" };
+  const sel = flowEd.selected === n.id ? " selected" : "";
+  const outs = FLOW_PORTS[n.type][1];
+  let ports = "";
+  if (FLOW_PORTS[n.type][0].includes("in")) {
+    const p = flowPortPos(n, "in", "in");
+    ports += `<circle class="flow-port-in" data-node="${esc(n.id)}" data-port="in" cx="${p.x - n.x}" cy="${p.y - n.y}" r="6"><title>in</title></circle>`;
+  }
+  for (const port of outs) {
+    const p = flowPortPos(n, port, "out");
+    ports += `<circle class="flow-port-out" data-node="${esc(n.id)}" data-port="${esc(port)}" cx="${p.x - n.x}" cy="${p.y - n.y}" r="6"><title>${esc(port)}</title></circle>
+      <text class="flow-port-label" x="${FLOW_NODE_W - 8}" y="${p.y - n.y - 9}" text-anchor="end">${esc(port)}</text>`;
+  }
+  return `<g class="flow-node cat-${t.cat}${sel}" data-id="${esc(n.id)}" transform="translate(${n.x},${n.y})">
+    <rect class="flow-node-box" width="${FLOW_NODE_W}" height="${FLOW_NODE_H}" rx="8"></rect>
+    <text class="flow-node-type" x="12" y="18">${esc(t.label)}</text>
+    <text class="flow-node-summary" x="12" y="42">${esc(flowSummary(n))}</text>
+    <text class="flow-node-hint" x="12" y="62">${esc(n.id)}</text>
+    ${ports}
+  </g>`;
+}
+
+function flowRender() {
+  const svg = $("flow-canvas");
+  let h = `<g transform="translate(${flowEd.pan.x},${flowEd.pan.y})"><g class="flow-edges">`;
+  flowEd.edges.forEach((e, i) => {
+    const a = flowEd.nodes.get(e.from), b = flowEd.nodes.get(e.to);
+    if (!a || !b) return;
+    const p1 = flowPortPos(a, e.from_port, "out"), p2 = flowPortPos(b, e.to_port, "in");
+    h += `<path class="flow-edge" data-i="${i}" d="${flowEdgePath(p1, p2)}"><title>Wire ${esc(e.from_port)} → ${esc(e.to_port)} (click to delete)</title></path>`;
+  });
+  if (flowEd.drag && flowEd.drag.kind === "link") {
+    const a = flowEd.nodes.get(flowEd.drag.from);
+    if (a) {
+      const p1 = flowPortPos(a, flowEd.drag.fromPort, "out");
+      h += `<path class="flow-edge temp" d="${flowEdgePath(p1, { x: flowEd.drag.x, y: flowEd.drag.y })}"/>`;
+    }
+  }
+  h += `</g><g class="flow-nodes">`;
+  for (const n of flowEd.nodes.values()) h += flowNodeHTML(n);
+  h += `</g></g>`;
+  svg.innerHTML = h;
+}
+
+/* ----- canvas interaction ----- */
+
+function flowBindCanvas() {
+  const svg = $("flow-canvas");
+  svg.addEventListener("pointerdown", (e) => {
+    const outPort = e.target.closest(".flow-port-out");
+    const nodeEl = e.target.closest(".flow-node");
+    flowEd.moved = false;
+    if (outPort && !flowEd.readonly) {
+      flowEd.drag = { kind: "link", from: outPort.dataset.node, fromPort: outPort.dataset.port, x: 0, y: 0 };
+      const p = svgPoint(e);
+      flowEd.drag.x = p.x - flowEd.pan.x;
+      flowEd.drag.y = p.y - flowEd.pan.y;
+      svg.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      return;
+    }
+    if (nodeEl) {
+      const nid = nodeEl.dataset.id;
+      flowSelect(nid);
+      if (!flowEd.readonly) {
+        const n = flowEd.nodes.get(nid);
+        const p = svgPoint(e);
+        flowEd.drag = { kind: "node", id: nid, dx: p.x - flowEd.pan.x - n.x, dy: p.y - flowEd.pan.y - n.y, sx: e.clientX, sy: e.clientY };
+        svg.setPointerCapture(e.pointerId);
+      }
+      return;
+    }
+    flowEd.drag = { kind: "pan", sx: e.clientX, sy: e.clientY, px: flowEd.pan.x, py: flowEd.pan.y };
+    svg.setPointerCapture(e.pointerId);
+  });
+  svg.addEventListener("pointermove", (e) => {
+    const d = flowEd.drag;
+    if (!d) return;
+    if (d.kind === "pan") {
+      if (Math.abs(e.clientX - d.sx) + Math.abs(e.clientY - d.sy) > 4) flowEd.moved = true;
+      flowEd.pan.x = d.px + (e.clientX - d.sx);
+      flowEd.pan.y = d.py + (e.clientY - d.sy);
+      flowRender();
+    } else if (d.kind === "node") {
+      if (Math.abs(e.clientX - d.sx) + Math.abs(e.clientY - d.sy) > 4) flowEd.moved = true;
+      const p = svgPoint(e);
+      const n = flowEd.nodes.get(d.id);
+      n.x = Math.round(p.x - flowEd.pan.x - d.dx);
+      n.y = Math.round(p.y - flowEd.pan.y - d.dy);
+      flowRender();
+    } else if (d.kind === "link") {
+      flowEd.moved = true;
+      const p = svgPoint(e);
+      d.x = p.x - flowEd.pan.x;
+      d.y = p.y - flowEd.pan.y;
+      flowRender();
+    }
+  });
+  svg.addEventListener("pointerup", (e) => {
+    const d = flowEd.drag;
+    flowEd.drag = null;
+    if (!d || d.kind !== "link") return;
+    const inPort = e.target.closest(".flow-port-in");
+    if (inPort) flowAddEdge(d.from, d.fromPort, inPort.dataset.node, inPort.dataset.port);
+    else flowRender();
+  });
+  svg.addEventListener("click", (e) => {
+    if (flowEd.moved || flowEd.readonly) return;
+    const edgeEl = e.target.closest(".flow-edge");
+    if (edgeEl && !edgeEl.classList.contains("temp")) {
+      flowEd.edges.splice(+edgeEl.dataset.i, 1);
+      flowRender();
+      flowValidateRender();
+      toast("Wire deleted");
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (state.view !== "flows" || flowEd.readonly) return;
+    const tag = (document.activeElement || {}).tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if ((e.key === "Delete" || e.key === "Backspace") && flowEd.selected) {
+      flowDeleteNode(flowEd.selected);
+    } else if (e.key === "Escape") {
+      flowSelect(null);
+    }
+  });
+}
+
+function flowAddEdge(from, fromPort, to, toPort) {
+  const a = flowEd.nodes.get(from), b = flowEd.nodes.get(to);
+  if (!a || !b) { flowRender(); return; }
+  if (from === to) { toast("A node cannot wire to itself"); flowRender(); return; }
+  if (!FLOW_PORTS[a.type][1].includes(fromPort) || !FLOW_PORTS[b.type][0].includes(toPort)) {
+    toast("Invalid ports"); flowRender(); return;
+  }
+  if (flowEd.edges.some((e) => e.to === to && e.to_port === toPort)) {
+    toast("That input port already has a wire"); flowRender(); return;
+  }
+  flowEd.edges.push({ from, from_port: fromPort, to, to_port: toPort });
+  flowRender();
+  flowValidateRender();
+}
+
+function flowDeleteNode(id) {
+  flowEd.nodes.delete(id);
+  flowEd.edges = flowEd.edges.filter((e) => e.from !== id && e.to !== id);
+  if (flowEd.selected === id) flowEd.selected = null;
+  flowRender();
+  flowRenderConfig();
+  flowValidateRender();
+}
+
+/* ----- selection + config panel ----- */
+
+function flowSelect(id) {
+  flowEd.selected = id;
+  flowRender();
+  flowRenderConfig();
+}
+
+function flowRenderConfig() {
+  const wrap = $("flow-config");
+  const body = $("flow-config-body");
+  const n = flowEd.selected ? flowEd.nodes.get(flowEd.selected) : null;
+  wrap.classList.toggle("hidden", !n);
+  if (!n) { body.innerHTML = ""; return; }
+  const ro = flowEd.readonly;
+  const dis = ro ? "disabled" : "";
+  let h = `<h3>${esc(flowTypeLabel(n.type))}</h3><p class="muted small">id: ${esc(n.id)}</p>`;
+  const t = FLOW_TYPES.find((x) => x.type === n.type);
+  if (t) h += `<p class="muted small">${esc(t.desc)}</p>`;
+  const cfg = n.config || {};
+  if (n.type === "llm_filter") {
+    h += `<label>Instructions<textarea id="fc-instructions" rows="5" ${dis} placeholder="Accept only…; reject…">${esc(cfg.instructions || "")}</textarea></label>`;
+  } else if (n.type === "llm") {
+    h += `<label>Prompt (use {{title}}, {{body}}, {{var:name}})<textarea id="fc-prompt" rows="5" ${dis} placeholder="Rewrite the item…">${esc(cfg.prompt || "")}</textarea></label>`;
+    const out = (cfg.output || "body").toString();
+    const isVar = out.startsWith("var:");
+    h += `<label>Output<select id="fc-output" ${dis}>
+      <option value="body"${!isVar ? " selected" : ""}>Replace body</option>
+      <option value="var"${isVar ? " selected" : ""}>Store in variable</option>
+    </select></label>`;
+    h += `<label id="fc-varwrap" class="${isVar ? "" : "hidden"}">Variable name<input id="fc-varname" type="text" value="${esc(isVar ? out.slice(4) : "")}" ${dis} placeholder="summary"></label>`;
+  } else if (n.type === "worker") {
+    const rt = (cfg.runtime || "").toString();
+    h += `<label>Runtime<select id="fc-runtime" ${dis}>
+      <option value="">Board default</option>
+      ${flowEd.runtimes.map((r) => `<option value="${esc(r)}"${r === rt ? " selected" : ""}>${esc(r)}</option>`).join("")}
+    </select></label>
+    <label class="checkline"><input id="fc-verify" type="checkbox"${cfg.verify !== false ? " checked" : ""} ${dis}> Run verifier before done</label>`;
+  } else if (n.type === "notify") {
+    h += `<label>Webhook URL<input id="fc-url" type="url" value="${esc(cfg.url || "")}" ${dis} placeholder="https://example.com/hook"></label>
+    <p class="muted small">POSTed <code>{card_id, board_id, title, transcript}</code> when the card closes.</p>`;
+  }
+  if (!ro) h += `<div class="admin-row" style="margin-top:12px"><button id="fc-delete" class="btn danger small">Delete node</button></div>`;
+  body.innerHTML = h;
+  if (ro) return;
+  const upd = (fn) => { fn(); flowRender(); flowValidateRender(); };
+  const bind = (id, fn) => { const el = $(id); if (el) el.addEventListener("change", () => upd(fn)); };
+  bind("fc-instructions", () => { n.config.instructions = $("fc-instructions").value; });
+  bind("fc-prompt", () => { n.config.prompt = $("fc-prompt").value; });
+  bind("fc-output", () => {
+    const v = $("fc-output").value;
+    n.config.output = v === "var" ? "var:" + ($("fc-varname").value.trim() || "out") : "body";
+    flowRenderConfig();
+  });
+  bind("fc-varname", () => { n.config.output = "var:" + ($("fc-varname").value.trim() || "out"); });
+  bind("fc-runtime", () => { n.config.runtime = $("fc-runtime").value; });
+  bind("fc-verify", () => { n.config.verify = $("fc-verify").checked; });
+  bind("fc-url", () => { n.config.url = $("fc-url").value.trim(); });
+  const del = $("fc-delete");
+  if (del) del.addEventListener("click", () => flowDeleteNode(n.id));
+}
+
+/* ----- client-side validation (mirrors the server; the server is authoritative) ----- */
+
+function flowValidate() {
+  const errs = [];
+  const nodes = [...flowEd.nodes.values()];
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const outEdges = new Map(), inEdges = new Map();
+  for (const e of flowEd.edges) {
+    if (!byId.has(e.from) || !byId.has(e.to)) { errs.push(`Wire references a missing node (${e.from} → ${e.to})`); continue; }
+    if (!outEdges.has(e.from)) outEdges.set(e.from, []);
+    if (!inEdges.has(e.to)) inEdges.set(e.to, []);
+    outEdges.get(e.from).push(e);
+    inEdges.get(e.to).push(e);
+  }
+  const inputs = nodes.filter((n) => n.type === "inbox" || n.type === "manual");
+  if (inputs.length === 0) errs.push("Flow needs at least one input node (inbox or manual)");
+  for (const kind of ["inbox", "manual"]) {
+    if (nodes.filter((n) => n.type === kind).length > 1) errs.push(`At most one ${kind} input node is allowed`);
+  }
+  const wiredIn = new Set(flowEd.edges.map((e) => e.to + ":" + e.to_port));
+  const optionalOut = (t, p) => (t === "llm_filter" && p === "reject") || (t === "worker" && p === "out");
+  for (const n of nodes) {
+    const [ins, outs] = FLOW_PORTS[n.type] || [[], []];
+    for (const p of ins) if (!wiredIn.has(n.id + ":" + p)) errs.push(`Node "${n.id}" (${n.type}): input "${p}" is not connected`);
+    for (const p of outs) {
+      if (optionalOut(n.type, p)) continue;
+      if (!(outEdges.get(n.id) || []).some((e) => e.from_port === p)) errs.push(`Node "${n.id}" (${n.type}): output "${p}" is not connected`);
+    }
+  }
+  // Cycle check.
+  const WHITE = 0, GRAY = 1, BLACK = 2;
+  const color = new Map(nodes.map((n) => [n.id, WHITE]));
+  let cyclic = false;
+  const dfs = (id) => {
+    color.set(id, GRAY);
+    for (const e of outEdges.get(id) || []) {
+      const c = color.get(e.to);
+      if (c === GRAY) { cyclic = true; return; }
+      if (c === WHITE) dfs(e.to);
+    }
+    color.set(id, BLACK);
+  };
+  for (const n of nodes) if (color.get(n.id) === WHITE) dfs(n.id);
+  if (cyclic) errs.push("Flow contains a cycle");
+  // Terminal paths + notify-after-worker.
+  const isTerminal = (t) => t === "worker" || t === "notify";
+  for (const n of nodes) {
+    if ((outEdges.get(n.id) || []).length === 0 && !isTerminal(n.type)) {
+      errs.push(`Node "${n.id}" (${n.type}): paths must end at a worker or notify node`);
+    }
+  }
+  const reachesInput = (startId) => {
+    const seen = new Set([startId]);
+    const stack = [startId];
+    while (stack.length) {
+      const id = stack.pop();
+      for (const e of inEdges.get(id) || []) {
+        const prev = byId.get(e.from);
+        if (!prev || prev.type === "worker") continue;
+        if (prev.type === "inbox" || prev.type === "manual") return true;
+        if (!seen.has(e.from)) { seen.add(e.from); stack.push(e.from); }
+      }
+    }
+    return false;
+  };
+  for (const n of nodes) {
+    if (n.type === "notify" && reachesInput(n.id)) {
+      errs.push(`Node "${n.id}" (notify): must come after a worker — a card has to exist first`);
+    }
+  }
+  // Config schema.
+  for (const n of nodes) {
+    const cfg = n.config || {};
+    const s = (v) => (v || "").toString().trim();
+    if (n.type === "llm_filter" && !s(cfg.instructions)) errs.push(`Node "${n.id}" (llm_filter): instructions are required`);
+    if (n.type === "llm") {
+      if (!s(cfg.prompt)) errs.push(`Node "${n.id}" (llm): prompt is required`);
+      const out = s(cfg.output) || "body";
+      if (out !== "body" && !out.startsWith("var:")) errs.push(`Node "${n.id}" (llm): output must be "body" or "var:<name>"`);
+    }
+    if (n.type === "notify") {
+      const u = s(cfg.url);
+      if (!u) errs.push(`Node "${n.id}" (notify): url is required`);
+      else if (!/^https?:\/\/.+\..+/.test(u)) errs.push(`Node "${n.id}" (notify): url must be an http(s) URL`);
+    }
+  }
+  return errs;
+}
+
+function flowValidateRender() {
+  const wrap = $("flow-validation");
+  const errs = flowValidate();
+  if (errs.length === 0) {
+    wrap.innerHTML = '<p class="flow-valid">\u2713 Flow looks valid</p>';
+  } else {
+    wrap.innerHTML = "<ul>" + errs.map((e) => `<li>${esc(e)}</li>`).join("") + "</ul>";
+  }
+}
+
+/* ----- save / reset ----- */
+
+function flowDefinitionJSON() {
+  return JSON.stringify({
+    nodes: [...flowEd.nodes.values()].map((n) => ({
+      id: n.id, type: n.type, x: Math.round(n.x), y: Math.round(n.y), config: n.config || {},
+    })),
+    edges: flowEd.edges.map((e) => ({ from: e.from, from_port: e.from_port, to: e.to, to_port: e.to_port })),
+  });
+}
+
+async function flowSave() {
+  hideError("flow-error");
+  const path = "/api/boards/" + encodeURIComponent(state.boardId) + "/flow";
+  try {
+    const res = await fetch(path, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Main flow", definition: flowDefinitionJSON() }),
+    });
+    if (!res.ok) {
+      let msg = res.statusText, errs = null;
+      try { const j = await res.json(); msg = j.error || msg; errs = j.errors || null; } catch { /* ignore */ }
+      showError("flow-error", msg + (errs ? ": " + errs.join("; ") : ""));
+      return;
+    }
+    toast("Flow saved");
+    flowValidateRender();
+    flowLoadRuns();
+  } catch (e) {
+    showError("flow-error", "Could not save flow: " + e.message);
+  }
+}
+
+async function flowReset() {
+  if (!confirm("Reset this board's flow to the default pipeline? Your custom flow will be replaced.")) return;
+  hideError("flow-error");
+  try {
+    await api("/api/boards/" + encodeURIComponent(state.boardId) + "/flow/reset", { method: "POST" });
+    toast("Flow reset to default");
+    await loadFlow();
+  } catch (e) {
+    if (e.message !== "unauthorized") showError("flow-error", "Could not reset flow: " + e.message);
+  }
+}
+
+function flowBindUI() {
+  flowBindCanvas();
+  $("flow-save").addEventListener("click", flowSave);
+  $("flow-reset").addEventListener("click", flowReset);
+  $("flow-config-close").addEventListener("click", () => flowSelect(null));
+}

@@ -58,6 +58,7 @@ type Card struct {
 	AgentRuntime   string `json:"agent_runtime"`
 	WaitReason     string `json:"wait_reason"` // why the card sits in waiting ("" when not waiting)
 	Transcript     string `json:"transcript"`   // archived markdown transcript, captured at done-time
+	SkipVerify     bool   `json:"skip_verify"`  // worker node with verify=false: skip the QA pass
 	HasOpenQuestion bool  `json:"has_open_question"`
 	CreatedAt      int64  `json:"created_at"`
 	UpdatedAt      int64  `json:"updated_at"`
@@ -207,6 +208,42 @@ type WikiProposal struct {
 	Status      string `json:"status"`  // pending | approved | rejected
 	CreatedAt   int64  `json:"created_at"`
 	DecidedAt   int64  `json:"decided_at"`
+}
+
+// Flow run statuses.
+const (
+	FlowRunOK       = "ok"
+	FlowRunRejected = "rejected"
+	FlowRunError    = "error"
+)
+
+// Flow is one board's visual pipeline: how inbound items flow through LLMs
+// to outputs. One flow per board (1:1); the definition is JSON (see the
+// flows package) and the default flow reproduces the built-in pipeline.
+type Flow struct {
+	ID         string `json:"id"`
+	BoardID    string `json:"board_id"`
+	Name       string `json:"name"`
+	Definition string `json:"definition"` // JSON: {nodes:[...], edges:[...]}
+	UpdatedAt  int64  `json:"updated_at"`
+}
+
+// FlowRun is one engine execution, kept for observability (30-day retention).
+type FlowRun struct {
+	ID        string `json:"id"`
+	FlowID    string `json:"flow_id"`
+	BoardID   string `json:"board_id"`
+	Status    string `json:"status"` // ok | rejected | error
+	Detail    string `json:"detail"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// FlowHook is a notify-on-close registration: when the card hits done, the
+// engine POSTs {card_id, board_id, title, transcript} to URL (best-effort),
+// then the row is deleted.
+type FlowHook struct {
+	CardID string `json:"card_id"`
+	URL    string `json:"url"`
 }
 
 // AuthSession is a login session (cookie token).

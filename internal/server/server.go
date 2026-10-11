@@ -17,17 +17,19 @@ import (
 	"github.com/dsbaha/drydock/internal/agents"
 	"github.com/dsbaha/drydock/internal/auth"
 	"github.com/dsbaha/drydock/internal/db"
+	"github.com/dsbaha/drydock/internal/flows"
 	"github.com/dsbaha/drydock/internal/ingest"
 	"github.com/dsbaha/drydock/internal/model"
 )
 
 // Server holds the API's dependencies.
 type Server struct {
-	DB   *db.DB
-	Auth *auth.Handler
-	Orch *agents.Orchestrator
-	Ing  *ingest.Service
-	Hub  *Hub
+	DB    *db.DB
+	Auth  *auth.Handler
+	Orch  *agents.Orchestrator
+	Ing   *ingest.Service
+	Flows *flows.Engine
+	Hub   *Hub
 }
 
 // New builds a Server.
@@ -123,6 +125,11 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.Handle("PUT /api/boards/{id}/wiki/{pageID}", authed(http.HandlerFunc(s.handleUpdateWikiPage)))
 	mux.Handle("DELETE /api/boards/{id}/wiki/{pageID}", authed(http.HandlerFunc(s.handleDeleteWikiPage)))
 
+	// Flows: per-board visual pipelines.
+	mux.Handle("GET /api/boards/{id}/flow", authed(http.HandlerFunc(s.handleGetFlow)))
+	mux.Handle("PUT /api/boards/{id}/flow", authed(http.HandlerFunc(s.handlePutFlow)))
+	mux.Handle("POST /api/boards/{id}/flow/reset", authed(http.HandlerFunc(s.handleResetFlow)))
+
 	// Cards.
 	mux.Handle("GET /api/cards/{id}", authed(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.detailFor(w, r.PathValue("id"))
@@ -154,6 +161,8 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.Handle("POST /api/admin/volumes/prune", authed(http.HandlerFunc(s.handlePruneVolumes)))
 	mux.Handle("GET /api/admin/settings", authed(http.HandlerFunc(s.handleGetSettings)))
 	mux.Handle("PUT /api/admin/settings", authed(http.HandlerFunc(s.handleUpdateSettings)))
+	mux.Handle("GET /api/admin/flow-runs", authed(http.HandlerFunc(s.handleFlowRuns)))
+	mux.Handle("GET /api/admin/runtimes", authed(http.HandlerFunc(s.handleRuntimes)))
 	mux.Handle("GET /api/admin/providers", authed(http.HandlerFunc(s.handleProviders)))
 	mux.Handle("POST /api/admin/providers", authed(http.HandlerFunc(s.handleCreateProvider)))
 	mux.Handle("DELETE /api/admin/providers/{id}", authed(http.HandlerFunc(s.handleDeleteProvider)))
@@ -269,10 +278,27 @@ func (s *Server) handleCreateCard(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "title is required")
 		return
 	}
-	card, err := s.Orch.IngestCard(board.ID, req.Title, req.Body, "manual")
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "ingest failed")
-		return
+	// Manual cards enter the board's flow at its manual input, like any
+	// other inbound item.
+	var card *model.Card
+	if s.Flows != nil {
+		res, err := s.Flows.TriggerManual(board.ID, req.Title, req.Body)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "flow failed: "+err.Error())
+			return
+		}
+		if res.Card == nil {
+			writeErr(w, http.StatusInternalServerError, "flow produced no card")
+			return
+		}
+		card = res.Card
+	} else {
+		var err error
+		card, err = s.Orch.IngestCard(board.ID, req.Title, req.Body, "manual")
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "ingest failed")
+			return
+		}
 	}
 	d, _ := s.cardDetail(card)
 	writeJSON(w, http.StatusCreated, d)
@@ -1048,6 +1074,121 @@ func (s *Server) handlePruneVolumes(w http.ResponseWriter, r *http.Request) {
 		results = []agents.PruneResult{}
 	}
 	writeJSON(w, http.StatusOK, results)
+}
+
+// ---------- flows ----------
+
+// flowForBoard loads the board's flow, seeding the default when none exists.
+func (s *Server) flowForBoard(boardID string) (*model.Flow, error) {
+	f, err := s.DB.GetFlow(boardID)
+	if err != nil {
+		return nil, err
+	}
+	if f != nil {
+		return f, nil
+	}
+	return s.DB.SaveFlow(boardID, "Main flow", flows.DefaultDefinitionJSON())
+}
+
+func (s *Server) handleGetFlow(w http.ResponseWriter, r *http.Request) {
+	board, err := s.DB.GetBoard(r.PathValue("id"))
+	if err != nil || board == nil {
+		writeErr(w, http.StatusNotFound, "board not found")
+		return
+	}
+	f, err := s.flowForBoard(board.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	writeJSON(w, http.StatusOK, f)
+}
+
+func (s *Server) handlePutFlow(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	board, err := s.DB.GetBoard(r.PathValue("id"))
+	if err != nil || board == nil {
+		writeErr(w, http.StatusNotFound, "board not found")
+		return
+	}
+	var req struct {
+		Name       string `json:"name"`
+		Definition string `json:"definition"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	def, err := flows.ParseDefinition(req.Definition)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, errs := flows.Compile(def); len(errs) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "flow does not compile", "errors": errs})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = "Main flow"
+	}
+	f, err := s.DB.SaveFlow(board.ID, name, req.Definition)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	writeJSON(w, http.StatusOK, f)
+}
+
+func (s *Server) handleResetFlow(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	board, err := s.DB.GetBoard(r.PathValue("id"))
+	if err != nil || board == nil {
+		writeErr(w, http.StatusNotFound, "board not found")
+		return
+	}
+	f, err := s.DB.SaveFlow(board.ID, "Main flow", flows.DefaultDefinitionJSON())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	writeJSON(w, http.StatusOK, f)
+}
+
+func (s *Server) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	boardID := r.URL.Query().Get("board_id")
+	if boardID == "" {
+		if b, err := s.DB.EnsureDefaultBoard(); err == nil {
+			boardID = b.ID
+		}
+	}
+	runs, err := s.DB.ListFlowRuns(boardID, 50)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if runs == nil {
+		runs = []*model.FlowRun{}
+	}
+	writeJSON(w, http.StatusOK, runs)
+}
+
+func (s *Server) handleRuntimes(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	names := s.Orch.RuntimeNames()
+	if names == nil {
+		names = []string{}
+	}
+	writeJSON(w, http.StatusOK, names)
 }
 
 // ---------- global settings ----------

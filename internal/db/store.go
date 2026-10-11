@@ -135,27 +135,28 @@ func scanCard(row interface {
 	Scan(...any) error
 }) (*model.Card, error) {
 	c := &model.Card{}
-	var openQ int
+	var openQ, skipV int
 	var transcript string
 	err := row.Scan(&c.ID, &c.BoardID, &c.Title, &c.Body, &c.Source, &c.Column,
-		&c.ProgressPct, &c.ContainerID, &c.AgentRuntime, &c.WaitReason, &openQ, &c.CreatedAt, &c.UpdatedAt, &transcript)
+		&c.ProgressPct, &c.ContainerID, &c.AgentRuntime, &c.WaitReason, &openQ, &c.CreatedAt, &c.UpdatedAt, &transcript, &skipV)
 	if err != nil {
 		return nil, err
 	}
 	c.HasOpenQuestion = openQ == 1
 	c.Transcript = transcript
+	c.SkipVerify = skipV == 1
 	return c, nil
 }
 
 const cardCols = `id, board_id, title, body, source, column_name, progress_pct,
-	container_id, agent_runtime, wait_reason, has_open_question, created_at, updated_at, transcript`
+	container_id, agent_runtime, wait_reason, has_open_question, created_at, updated_at, transcript, skip_verify`
 
 func (d *DB) CreateCard(c *model.Card) error {
 	_, err := d.Exec(`INSERT INTO cards (id, board_id, title, body, source, column_name,
-		progress_pct, container_id, agent_runtime, wait_reason, has_open_question, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		progress_pct, container_id, agent_runtime, wait_reason, has_open_question, created_at, updated_at, skip_verify)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.BoardID, c.Title, c.Body, c.Source, c.Column, c.ProgressPct,
-		c.ContainerID, c.AgentRuntime, c.WaitReason, boolInt(c.HasOpenQuestion), c.CreatedAt, c.UpdatedAt)
+		c.ContainerID, c.AgentRuntime, c.WaitReason, boolInt(c.HasOpenQuestion), c.CreatedAt, c.UpdatedAt, boolInt(c.SkipVerify))
 	return err
 }
 
@@ -918,4 +919,94 @@ func (d *DB) ApplyWikiProposal(id, editedBy string) (*model.WikiPage, error) {
 		return nil, err
 	}
 	return page, nil
+}
+
+// ---------- flows ----------
+
+// GetFlow returns the board's flow, or nil when none is configured.
+func (d *DB) GetFlow(boardID string) (*model.Flow, error) {
+	f := &model.Flow{}
+	err := d.QueryRow(`SELECT id, board_id, name, definition, updated_at FROM flows WHERE board_id = ?`, boardID).
+		Scan(&f.ID, &f.BoardID, &f.Name, &f.Definition, &f.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return f, err
+}
+
+// SaveFlow creates or replaces the board's flow (one flow per board).
+func (d *DB) SaveFlow(boardID, name, definition string) (*model.Flow, error) {
+	now := Now()
+	f := &model.Flow{ID: NewID(), BoardID: boardID, Name: name, Definition: definition, UpdatedAt: now}
+	_, err := d.Exec(`INSERT INTO flows (id, board_id, name, definition, updated_at) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(board_id) DO UPDATE SET name = excluded.name, definition = excluded.definition, updated_at = excluded.updated_at`,
+		f.ID, f.BoardID, f.Name, f.Definition, f.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return d.GetFlow(boardID)
+}
+
+// LogFlowRun records one engine execution.
+func (d *DB) LogFlowRun(flowID, boardID, status, detail string) error {
+	_, err := d.Exec(`INSERT INTO flow_runs (id, flow_id, board_id, status, detail, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`, NewID(), flowID, boardID, status, detail, Now())
+	return err
+}
+
+// ListFlowRuns returns the most recent runs for a board, newest first.
+func (d *DB) ListFlowRuns(boardID string, limit int) ([]*model.FlowRun, error) {
+	rows, err := d.Query(`SELECT id, flow_id, board_id, status, detail, created_at FROM flow_runs
+		WHERE board_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`, boardID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.FlowRun
+	for rows.Next() {
+		r := &model.FlowRun{}
+		if err := rows.Scan(&r.ID, &r.FlowID, &r.BoardID, &r.Status, &r.Detail, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// PruneFlowRuns deletes runs older than olderThanSec seconds.
+func (d *DB) PruneFlowRuns(olderThanSec int64) error {
+	_, err := d.Exec(`DELETE FROM flow_runs WHERE created_at < ?`, Now()-olderThanSec)
+	return err
+}
+
+// ---------- flow hooks (notify on close) ----------
+
+// SetFlowHook registers (or replaces) a close-notification hook for a card.
+func (d *DB) SetFlowHook(cardID, url string) error {
+	_, err := d.Exec(`INSERT INTO flow_hooks (card_id, url) VALUES (?, ?)
+		ON CONFLICT(card_id) DO UPDATE SET url = excluded.url`, cardID, url)
+	return err
+}
+
+// GetFlowHook returns the hook URL for a card, or "" when none is registered.
+func (d *DB) GetFlowHook(cardID string) (string, error) {
+	var url string
+	err := d.QueryRow(`SELECT url FROM flow_hooks WHERE card_id = ?`, cardID).Scan(&url)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return url, err
+}
+
+// DeleteFlowHook removes a card's hook registration.
+func (d *DB) DeleteFlowHook(cardID string) error {
+	_, err := d.Exec(`DELETE FROM flow_hooks WHERE card_id = ?`, cardID)
+	return err
+}
+
+// SetCardSkipVerify toggles whether the card skips the QA pass when its
+// worker finishes.
+func (d *DB) SetCardSkipVerify(id string, skip bool) error {
+	_, err := d.Exec(`UPDATE cards SET skip_verify = ? WHERE id = ?`, boolInt(skip), id)
+	return err
 }

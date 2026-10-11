@@ -18,11 +18,14 @@ import (
 	"time"
 
 	"github.com/dsbaha/drydock/internal/db"
+	"github.com/dsbaha/drydock/internal/flows"
 	"github.com/dsbaha/drydock/internal/model"
 )
 
-// CardSink receives new cards from connectors.
-type CardSink func(boardID, title, body, source string) (*model.Card, error)
+// CardSink receives new cards from connectors. kind is "rss" | "webhook";
+// the sink routes the item through the board's flow, which may create the
+// card, decline it at a flow-level filter, or fail.
+type CardSink func(boardID, kind, title, body, source string) (*flows.Result, error)
 
 // Connector is a configured data source. Poll-based connectors implement
 // Poll; push-based ones (webhooks) are driven by the server instead.
@@ -93,25 +96,37 @@ func (s *Service) Webhook(source string, payload map[string]any) (Outcome, error
 			log.Printf("drydock: webhook %q rejected item %q: %s", source, title, reason)
 			return Outcome{Accepted: false, Reason: reason}, nil
 		}
-		return s.acceptCard(board.ID, title, body, fullSource, reason)
+		return s.acceptCard(board.ID, "webhook", title, body, fullSource, reason)
 	}
-	card, err := s.Sink(board.ID, title, body, fullSource)
+	res, err := s.Sink(board.ID, "webhook", title, body, fullSource)
 	if err != nil {
 		return Outcome{}, err
 	}
-	return Outcome{Card: card, Accepted: true}, nil
+	if res.Rejected {
+		return Outcome{Accepted: false, Reason: res.Reason}, nil
+	}
+	return Outcome{Card: res.Card, Accepted: true}, nil
 }
 
-// acceptCard creates the card via the sink and records the filter verdict.
-// A fail-open verdict ("filter unavailable: ...") is logged as an event so
-// the admin UI can hint that the filter was not actually consulted.
-func (s *Service) acceptCard(boardID, title, body, source, reason string) (Outcome, error) {
-	card, err := s.Sink(boardID, title, body, source)
+// acceptCard routes an intake-filtered item through the board's flow and
+// records the filter verdict. A fail-open verdict ("filter unavailable: ...")
+// is logged as an event so the admin UI can hint that the filter was not
+// actually consulted.
+func (s *Service) acceptCard(boardID, kind, title, body, source, reason string) (Outcome, error) {
+	res, err := s.Sink(boardID, kind, title, body, source)
 	if err != nil {
 		return Outcome{}, err
 	}
-	if strings.HasPrefix(reason, unavailablePrefix) {
-		_ = s.DB.LogEvent(card.ID, "filter", "accepted ("+reason+")")
+	if res.Rejected {
+		return Outcome{Accepted: false, Reason: res.Reason}, nil
+	}
+	card := res.Card
+	r := reason
+	if r == "" {
+		r = res.Reason // flow-level fail-open verdict, if any
+	}
+	if card != nil && strings.HasPrefix(r, unavailablePrefix) {
+		_ = s.DB.LogEvent(card.ID, "filter", "accepted ("+r+")")
 	}
 	return Outcome{Card: card, Accepted: true, Reason: reason}, nil
 }
@@ -200,18 +215,22 @@ func (s *Service) PollFeed(feed *model.Feed) (int, error) {
 				log.Printf("drydock: feed %q rejected item %q: %s", feed.Name, title, reason)
 				continue
 			}
-			if _, err := s.acceptCard(feed.BoardID, title, body, source, reason); err != nil {
+			if _, err := s.acceptCard(feed.BoardID, "rss", title, body, source, reason); err != nil {
 				log.Printf("drydock: rss card create: %v", err)
 				continue
 			}
 			created++
 			continue
 		}
-		if _, err := s.Sink(feed.BoardID, title, body, source); err != nil {
+		res, err := s.Sink(feed.BoardID, "rss", title, body, source)
+		if err != nil {
 			log.Printf("drydock: rss card create: %v", err)
 			continue
 		}
 		_ = s.DB.FeedMarkSeen(feed.ID, guid)
+		if res.Rejected {
+			continue // flow-level filter declined it; recorded in rejected_items
+		}
 		created++
 	}
 	_ = s.DB.TouchFeed(feed.ID, db.Now())

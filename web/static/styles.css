@@ -540,3 +540,69 @@ code { background: var(--bg3); padding: 1px 5px; border-radius: 4px; font-size: 
   padding: 1px 5px;
   margin-left: 6px;
 }
+
+/* ---------------- flows editor ---------------- */
+.flow-palette {
+  width: 264px;
+  flex: none;
+  border-right: 1px solid var(--border);
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.flow-palette .muted.small { font-size: 12px; }
+.flow-palette-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  margin-bottom: 6px;
+  border-left: 3px solid var(--gray);
+  text-align: left;
+}
+.flow-palette-btn span { font-weight: 400; color: var(--muted); font-size: 11px; }
+.flow-palette-btn.cat-input { border-left-color: var(--green); }
+.flow-palette-btn.cat-processor { border-left-color: var(--accent); }
+.flow-palette-btn.cat-output { border-left-color: #a371f7; }
+.flow-validation { font-size: 12px; }
+.flow-validation ul { margin: 8px 0; padding-left: 18px; color: var(--red); }
+.flow-validation li { margin-bottom: 4px; }
+.flow-valid { color: var(--green); margin: 8px 0; }
+.flow-run { display: flex; gap: 8px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+.flow-run-status { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: var(--bg3); color: var(--muted); flex: none; }
+.flow-run-status.ok { color: var(--green); }
+.flow-run-status.rejected { color: var(--amber); }
+.flow-run-status.error { color: var(--red); }
+.flow-run-detail { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.flow-main { flex: 1; min-width: 0; position: relative; background: var(--bg); }
+#flow-canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab;
+  background-image: radial-gradient(circle, var(--border) 1px, transparent 1px);
+  background-size: 24px 24px; }
+#flow-canvas:active { cursor: grabbing; }
+.flow-node { cursor: grab; }
+.flow-node-box { fill: var(--bg2); stroke: var(--gray); stroke-width: 1.5; }
+.flow-node.cat-input .flow-node-box { stroke: var(--green); }
+.flow-node.cat-processor .flow-node-box { stroke: var(--accent); }
+.flow-node.cat-output .flow-node-box { stroke: #a371f7; }
+.flow-node.selected .flow-node-box { stroke-width: 3; }
+.flow-node-type { fill: var(--text); font-size: 13px; font-weight: 700; pointer-events: none; }
+.flow-node-summary { fill: var(--muted); font-size: 11px; pointer-events: none; }
+.flow-node-hint { fill: var(--gray); font-size: 10px; pointer-events: none; }
+.flow-port-in, .flow-port-out { fill: var(--bg); stroke: var(--text); stroke-width: 1.5; cursor: crosshair; }
+.flow-port-in:hover, .flow-port-out:hover { fill: var(--accent); stroke: var(--accent); }
+.flow-port-label { fill: var(--muted); font-size: 10px; pointer-events: none; }
+.flow-edge { fill: none; stroke: var(--muted); stroke-width: 2; cursor: pointer; }
+.flow-edge:hover { stroke: var(--red); stroke-width: 3; }
+.flow-edge.temp { stroke: var(--accent); stroke-dasharray: 6 4; pointer-events: none; }
+.flow-config { width: 300px; flex: none; border-left: 1px solid var(--border); padding: 16px; overflow-y: auto; }
+.flow-config-head { display: flex; align-items: center; margin-bottom: 12px; }
+.flow-config h3 { margin: 0 0 4px; }
+.flow-config label { display: block; margin: 10px 0; font-size: 13px; }
+.flow-config input[type="text"], .flow-config input[type="url"], .flow-config textarea, .flow-config select {
+  width: 100%; margin-top: 4px; background: var(--bg2); border: 1px solid var(--border);
+  color: var(--text); border-radius: 6px; padding: 8px; font-size: 13px; font-family: inherit;
+}
+.flow-config textarea { resize: vertical; }
