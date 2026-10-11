@@ -168,6 +168,9 @@ func (d *DB) migrate() error {
 	if err := d.ensureColumn("feeds", "filter_instructions", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := d.ensureColumn("cards", "transcript", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
 }
 

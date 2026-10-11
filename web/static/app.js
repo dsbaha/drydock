@@ -414,7 +414,7 @@ function renderDrawer() {
   info.className = "drawer-info";
   const infoBits = [d.source || "manual"];
   if (d.agent_runtime) infoBits.push(d.agent_runtime);
-  infoBits.push(d.container_id ? "container " + shortContainer(d.container_id) : (d.column === "done" ? "container removed" : "no container"));
+  infoBits.push(d.container_id ? "container " + shortContainer(d.container_id) : (d.column === "done" ? "container & volume removed" : "no container"));
   infoBits.push(timeAgo(d.updated_at));
   infoBits.forEach((b, i) => {
     if (i > 0) {
@@ -435,15 +435,16 @@ function renderDrawer() {
     actions.className = "drawer-actions";
     const stopBtn = document.createElement("button");
     stopBtn.className = "btn danger small";
-    stopBtn.textContent = "Stop container";
+    stopBtn.textContent = "Remove container & volume";
     stopBtn.addEventListener("click", async () => {
+      if (!window.confirm("Remove this card's container and its volume? The transcript stays in the database, but anything in /workspace will be gone.")) return;
       stopBtn.disabled = true;
       try {
         await api("/api/cards/" + encodeURIComponent(d.id) + "/stop", { method: "POST" });
-        toast("Container stopped (volume kept).");
+        toast("Container and volume removed.");
         await refreshDetail();
       } catch (e) {
-        if (e.message !== "unauthorized") toast("Stop failed: " + e.message);
+        if (e.message !== "unauthorized") toast("Remove failed: " + e.message);
       } finally {
         stopBtn.disabled = false;
       }

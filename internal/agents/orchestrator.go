@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,12 +24,24 @@ type Notifier interface {
 	NotifyChat(cardID string, frame map[string]any)
 }
 
+// dockerClient is the subset of dockerx.Client the orchestrator uses. Kept
+// as an interface so tests can substitute a fake; production passes the real
+// *dockerx.Client.
+type dockerClient interface {
+	StopAndRemove(ctx context.Context, containerID string) error
+	RemoveVolume(ctx context.Context, name string) error
+	FindCardContainer(ctx context.Context, cardID string) (string, bool, error)
+	ImageExists(ctx context.Context, ref string) bool
+	PullImage(ctx context.Context, ref string) error
+	CreateAndStart(ctx context.Context, opts dockerx.CreateOptions) (string, error)
+}
+
 // Orchestrator owns the card lifecycle: it starts worker/verifier runtimes,
 // persists their events, provisions per-card containers, and drives column
 // transitions.
 type Orchestrator struct {
 	DB             *db.DB
-	Docker         *dockerx.Client // nil when no runtime is reachable
+	Docker         dockerClient // nil when no runtime is reachable
 	Image          string
 	DefaultRuntime string
 	Notify         Notifier
@@ -46,9 +59,15 @@ type runState struct {
 
 // New builds an Orchestrator with the demo runtimes registered.
 func New(database *db.DB, docker *dockerx.Client, image, defaultRuntime string, notify Notifier) *Orchestrator {
+	// Normalize a typed-nil *dockerx.Client to a nil interface so
+	// o.Docker == nil stays a reliable "no runtime" check.
+	var dc dockerClient
+	if docker != nil {
+		dc = docker
+	}
 	o := &Orchestrator{
 		DB:             database,
-		Docker:         docker,
+		Docker:         dc,
 		Image:          image,
 		DefaultRuntime: defaultRuntime,
 		Notify:         notify,
@@ -269,6 +288,15 @@ func (o *Orchestrator) MoveCard(cardID, column, reason string) (*model.Card, err
 	_ = o.DB.LogEvent(cardID, "moved", "column="+column)
 	switch column {
 	case model.ColWorking:
+		// Reopening a done card: it starts with a fresh empty volume, so
+		// post the archived transcript excerpt for continuity.
+		if card.Column == model.ColDone && card.Transcript != "" {
+			_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: cardID,
+				From: model.FromSystem,
+				Text: "Previous attempt archived transcript:\n\n" +
+					truncateRunes(card.Transcript, reopenTranscriptMaxRunes),
+				CreatedAt: db.Now()})
+		}
 		o.StartCard(cardID)
 	case model.ColQA:
 		o.MoveToQA(cardID)
@@ -327,75 +355,158 @@ func (o *Orchestrator) ChatMessage(cardID, text string) error {
 	return nil
 }
 
-// StopContainer stops and removes the card's container. The named volume is
-// kept, so /workspace survives.
+// StopContainer removes the card's container and its named volume. The chat
+// transcript, steps, questions and events already live in the database, so
+// nothing of value is lost with the volume.
 func (o *Orchestrator) StopContainer(cardID string) error {
-	removed, err := o.removeContainer(cardID)
-	if err != nil {
-		return err
+	card, err := o.DB.GetCard(cardID)
+	if err != nil || card == nil {
+		return fmt.Errorf("card not found")
 	}
-	if removed == "" {
+	if card.ContainerID == "" || o.Docker == nil {
 		return fmt.Errorf("no container to stop")
 	}
-	_ = o.DB.LogEvent(cardID, "container_stopped", "")
+	detail := o.teardownCard(cardID)
+	_ = o.DB.LogEvent(cardID, "container_removed", detail)
+	_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: cardID,
+		From: model.FromSystem, Text: "Container and volume removed.", CreatedAt: db.Now()})
 	o.refreshNotify(cardID, "updated")
 	return nil
 }
 
-// removeContainer stops and removes the card's container and returns the
-// removed container ID, or "" when there was nothing to remove (no container
-// recorded, or no Docker client). The named volume is kept, so the
-// /workspace work artifacts survive — a reopened card gets a fresh container
-// mounted on the same volume. Stale container IDs are cleared even when
-// there is nothing to remove.
-func (o *Orchestrator) removeContainer(cardID string) (string, error) {
+// teardownCard stops and removes the card's container AND its named volume,
+// so no orphaned volumes accumulate. Best-effort: when there is no container,
+// no Docker client, or removal fails, it returns a description of what
+// happened instead of an error — callers must never fail a transition over
+// teardown. Stale container IDs are cleared even when there is nothing to
+// remove.
+func (o *Orchestrator) teardownCard(cardID string) string {
 	card, err := o.DB.GetCard(cardID)
 	if err != nil || card == nil {
-		return "", fmt.Errorf("card not found")
+		return "card not found"
 	}
+	vol := dockerx.VolumeName(cardID)
 	if card.ContainerID == "" || o.Docker == nil {
 		_ = o.DB.SetCardContainer(cardID, "")
-		return "", nil
+		return "no container"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := o.Docker.StopAndRemove(ctx, card.ContainerID); err != nil {
-		return "", err
-	}
 	removed := card.ContainerID
+	detail := "container=" + removed
+	if err := o.Docker.StopAndRemove(ctx, removed); err != nil {
+		log.Printf("drydock: remove container for card %s: %v", cardID, err)
+		detail += " container_error=" + err.Error()
+	}
+	if err := o.Docker.RemoveVolume(ctx, vol); err != nil {
+		log.Printf("drydock: remove volume %s for card %s: %v", vol, cardID, err)
+		detail += " volume_error=" + err.Error()
+	} else {
+		detail += " volume=" + vol + " removed"
+	}
 	_ = o.DB.SetCardContainer(cardID, "")
-	return removed, nil
+	return detail
 }
 
-// MoveToDone transitions a card to done: cancels any live run, marks
-// progress complete, and removes the card's container (see removeContainer —
-// the named volume is kept). Container removal is best-effort: when there is
-// no container, no Docker client, or removal fails, the done transition still
-// succeeds and the outcome is logged, never fatal.
+// MoveToDone transitions a card to done: archives a transcript snapshot,
+// cancels any live run, marks progress complete, and tears down the card's
+// container and volume (see teardownCard). Teardown is best-effort — the done
+// transition always succeeds and the outcome is logged, never fatal.
 func (o *Orchestrator) MoveToDone(cardID string) {
 	card, err := o.DB.GetCard(cardID)
 	if err != nil || card == nil {
 		return
 	}
-	o.stopRun(cardID)
-	removed, err := o.removeContainer(cardID)
-	detail := "no container"
-	switch {
-	case err != nil:
-		log.Printf("drydock: remove container for done card %s: %v", cardID, err)
-		detail = "error: " + err.Error()
-	case removed != "":
-		detail = "container=" + removed
+	// Archive the full transcript first: chat, steps, questions and events
+	// already live in the database, and this snapshot keeps the done card
+	// self-contained even if those tables are pruned later.
+	if t := o.buildTranscript(cardID); t != "" {
+		_ = o.DB.SetCardTranscript(cardID, t)
 	}
+	o.stopRun(cardID)
+	detail := o.teardownCard(cardID)
 	_ = o.DB.LogEvent(cardID, "container_removed", detail)
 	_ = o.DB.SetCardColumn(cardID, model.ColDone)
 	_ = o.DB.SetCardProgress(cardID, 100)
 	_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: cardID,
-		From: model.FromSystem, Text: "Container removed.", CreatedAt: db.Now()})
+		From: model.FromSystem, Text: "Container and volume removed.", CreatedAt: db.Now()})
 	o.refreshNotify(cardID, "moved")
 }
 
-// ---------- event handling (Emitter) ----------
+// transcriptMaxRunes bounds the archived transcript stored on a done card.
+const transcriptMaxRunes = 64 * 1024
+
+// reopenTranscriptMaxRunes bounds the archived transcript excerpt posted as
+// a system message when a done card reopens.
+const reopenTranscriptMaxRunes = 8 * 1024
+
+// buildTranscript renders the card's full history — metadata, steps,
+// questions with answers, chat messages and the event log — as markdown, so
+// a done card stays self-contained in the database after its container and
+// volume are gone.
+func (o *Orchestrator) buildTranscript(cardID string) string {
+	card, err := o.DB.GetCard(cardID)
+	if err != nil || card == nil {
+		return ""
+	}
+	var b strings.Builder
+	ts := func(t int64) string { return time.Unix(t, 0).UTC().Format(time.RFC3339) }
+	fmt.Fprintf(&b, "# %s\n\n", card.Title)
+	fmt.Fprintf(&b, "- Source: %s\n- Board: %s\n- Runtime: %s\n- Created: %s\n- Finished: %s\n\n",
+		card.Source, card.BoardID, card.AgentRuntime, ts(card.CreatedAt), ts(db.Now()))
+	if card.Body != "" {
+		fmt.Fprintf(&b, "## Task\n\n%s\n\n", card.Body)
+	}
+	if steps, err := o.DB.ListSteps(cardID); err == nil && len(steps) > 0 {
+		b.WriteString("## Steps\n\n")
+		for _, s := range steps {
+			mark := "[ ]"
+			if s.Done {
+				mark = "[x]"
+			}
+			fmt.Fprintf(&b, "- %s %s\n", mark, s.Label)
+		}
+		b.WriteString("\n")
+	}
+	if qs, err := o.DB.ListQuestions(cardID); err == nil && len(qs) > 0 {
+		b.WriteString("## Questions\n\n")
+		for _, q := range qs {
+			fmt.Fprintf(&b, "- **%s** (%s): %s\n", q.From, ts(q.CreatedAt), q.Text)
+			if q.Answer != "" {
+				fmt.Fprintf(&b, "  - Answer: %s\n", q.Answer)
+			}
+		}
+		b.WriteString("\n")
+	}
+	if msgs, err := o.DB.ListMessages(cardID, 0); err == nil && len(msgs) > 0 {
+		b.WriteString("## Chat\n\n")
+		for _, m := range msgs {
+			fmt.Fprintf(&b, "**%s** (%s):\n\n%s\n\n", m.From, ts(m.CreatedAt), m.Text)
+		}
+	}
+	if evs, err := o.DB.ListEvents(cardID, 1000); err == nil && len(evs) > 0 {
+		b.WriteString("## Events\n\n")
+		// ListEvents returns newest-first; render chronologically.
+		for i := len(evs) - 1; i >= 0; i-- {
+			e := evs[i]
+			fmt.Fprintf(&b, "- %s %s %s\n", ts(e.CreatedAt), e.Kind, e.Payload)
+		}
+		b.WriteString("\n")
+	}
+	return truncateRunes(b.String(), transcriptMaxRunes)
+}
+
+// truncateRunes cuts s to at most n runes, appending an ellipsis marker.
+func truncateRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "\n…[truncated]"
+}
 
 // Emit persists a runtime event and fans it out to websockets. It is called
 // from runtime goroutines.

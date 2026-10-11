@@ -2,11 +2,14 @@ package agents
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/dsbaha/drydock/internal/db"
+	"github.com/dsbaha/drydock/internal/dockerx"
 	"github.com/dsbaha/drydock/internal/model"
 )
 
@@ -417,18 +420,178 @@ func TestMoveToDoneRemovesContainer(t *testing.T) {
 	}
 	seen = false
 	for _, m := range msgs {
-		if m.From == model.FromSystem && m.Text == "Container removed." {
+		if m.From == model.FromSystem && m.Text == "Container and volume removed." {
 			seen = true
 		}
 	}
 	if !seen {
-		t.Fatal("no \"Container removed.\" system message posted")
+		t.Fatal("no \"Container and volume removed.\" system message posted")
 	}
 }
 
+// TestMoveToDoneCapturesTranscript: the done transition archives a markdown
+// transcript containing the card's steps, questions (with answers) and chat
+// messages, so the card stays self-contained after its volume is gone.
+func TestMoveToDoneCapturesTranscript(t *testing.T) {
+	o, database := testOrchestrator(t)
+	board, err := database.EnsureDefaultBoard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := o.IngestCard(board.ID, "Transcript archival", "The task body.", "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ReplaceSteps(card.ID, []string{"first step", "second step"}); err != nil {
+		t.Fatal(err)
+	}
+	steps, _ := database.ListSteps(card.ID)
+	if len(steps) != 2 {
+		t.Fatalf("steps = %d, want 2", len(steps))
+	}
+	if err := database.MarkStepDone(steps[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	q := &model.Question{ID: db.NewID(), CardID: card.ID, Text: "Which way?", CreatedAt: db.Now()}
+	if err := database.CreateQuestion(q); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AnswerQuestion(q.ID, "left"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddMessage(&model.Message{ID: db.NewID(), CardID: card.ID,
+		From: model.FromUser, Text: "hello agent", CreatedAt: db.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	o.MoveToDone(card.ID)
+
+	c := getCard(t, database, card.ID)
+	if c.Transcript == "" {
+		t.Fatal("transcript is empty after done")
+	}
+	for _, want := range []string{
+		"# Transcript archival",
+		"first step", "second step",
+		"Which way?", "left",
+		"hello agent",
+		"## Steps", "## Questions", "## Chat", "## Events",
+	} {
+		if !strings.Contains(c.Transcript, want) {
+			t.Fatalf("transcript missing %q", want)
+		}
+	}
+	if !strings.Contains(c.Transcript, "[x] first step") || !strings.Contains(c.Transcript, "[ ] second step") {
+		t.Fatal("transcript step checklist wrong")
+	}
+}
+
+// fakeDocker records container/volume teardown calls for tests.
+type fakeDocker struct {
+	mu      sync.Mutex
+	stopped []string
+	volumes []string
+}
+
+func (f *fakeDocker) StopAndRemove(ctx context.Context, containerID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopped = append(f.stopped, containerID)
+	return nil
+}
+
+func (f *fakeDocker) RemoveVolume(ctx context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.volumes = append(f.volumes, name)
+	return nil
+}
+
+func (f *fakeDocker) FindCardContainer(ctx context.Context, cardID string) (string, bool, error) {
+	return "", false, nil
+}
+
+func (f *fakeDocker) ImageExists(ctx context.Context, ref string) bool { return true }
+
+func (f *fakeDocker) PullImage(ctx context.Context, ref string) error { return nil }
+
+func (f *fakeDocker) CreateAndStart(ctx context.Context, opts dockerx.CreateOptions) (string, error) {
+	return "fake-new-container", nil
+}
+
+// TestTeardownRemovesContainerAndVolume: with a Docker client present, the
+// done transition removes both the container and the card's named volume.
+func TestTeardownRemovesContainerAndVolume(t *testing.T) {
+	o, database := testOrchestrator(t)
+	fake := &fakeDocker{}
+	o.Docker = fake
+	board, err := database.EnsureDefaultBoard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := o.IngestCard(board.ID, "Volume teardown", "", "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetCardContainer(card.ID, "fake-container-9"); err != nil {
+		t.Fatal(err)
+	}
+
+	o.MoveToDone(card.ID)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.stopped) != 1 || fake.stopped[0] != "fake-container-9" {
+		t.Fatalf("StopAndRemove calls = %v, want [fake-container-9]", fake.stopped)
+	}
+	wantVol := dockerx.VolumeName(card.ID)
+	if len(fake.volumes) != 1 || fake.volumes[0] != wantVol {
+		t.Fatalf("RemoveVolume calls = %v, want [%s]", fake.volumes, wantVol)
+	}
+	if c := getCard(t, database, card.ID); c.ContainerID != "" {
+		t.Fatalf("ContainerID = %q, want cleared", c.ContainerID)
+	}
+}
+
+// TestTeardownBestEffort: a failing Docker client must not fail the done
+// transition; the outcome is logged instead.
+func TestTeardownBestEffort(t *testing.T) {
+	o, database := testOrchestrator(t)
+	o.Docker = &failingDocker{}
+	board, err := database.EnsureDefaultBoard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := o.IngestCard(board.ID, "Best effort", "", "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetCardContainer(card.ID, "fake-container-x"); err != nil {
+		t.Fatal(err)
+	}
+
+	o.MoveToDone(card.ID) // must not panic or wedge
+
+	if c := getCard(t, database, card.ID); c.Column != model.ColDone {
+		t.Fatalf("column = %q, want done", c.Column)
+	}
+}
+
+// failingDocker fails every teardown call.
+type failingDocker struct{ fakeDocker }
+
+func (f *failingDocker) StopAndRemove(ctx context.Context, containerID string) error {
+	return errors.New("fake docker failure")
+}
+
+func (f *failingDocker) RemoveVolume(ctx context.Context, name string) error {
+	return errors.New("fake docker failure")
+}
+
 // TestReopenAfterDone: a card that reaches done through the natural pipeline
-// (verifier approval removes the container) can be moved back to working and
-// completes again — the reopened run provisions from the kept volume.
+// (verifier approval tears down the container and volume) can be moved back
+// to working and completes again on a fresh empty volume. The archived
+// transcript is posted as a system message so the new run keeps context.
 func TestReopenAfterDone(t *testing.T) {
 	o, database := testOrchestrator(t)
 	board, err := database.EnsureDefaultBoard()
@@ -470,6 +633,20 @@ func TestReopenAfterDone(t *testing.T) {
 	}
 	if moved.Column != model.ColWorking {
 		t.Fatalf("column = %q, want working", moved.Column)
+	}
+	// The archived transcript was posted as a system message for continuity.
+	found := false
+	msgs, _ := database.ListMessages(card.ID, 1000)
+	for _, m := range msgs {
+		if m.From == model.FromSystem && strings.HasPrefix(m.Text, "Previous attempt archived transcript:") {
+			found = true
+			if !strings.Contains(m.Text, "Reopen lifecycle") {
+				t.Fatal("reopen transcript message missing card title")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no archived-transcript system message posted on reopen")
 	}
 	waitFor(t, "done again", 10*time.Second, func() bool {
 		return getCard(t, database, card.ID).Column == model.ColDone

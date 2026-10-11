@@ -56,6 +56,7 @@ type Card struct {
 	ContainerID    string `json:"container_id"`
 	AgentRuntime   string `json:"agent_runtime"`
 	WaitReason     string `json:"wait_reason"` // why the card sits in waiting ("" when not waiting)
+	Transcript     string `json:"transcript"`   // archived markdown transcript, captured at done-time
 	HasOpenQuestion bool  `json:"has_open_question"`
 	CreatedAt      int64  `json:"created_at"`
 	UpdatedAt      int64  `json:"updated_at"`

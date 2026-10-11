@@ -130,17 +130,19 @@ func scanCard(row interface {
 }) (*model.Card, error) {
 	c := &model.Card{}
 	var openQ int
+	var transcript string
 	err := row.Scan(&c.ID, &c.BoardID, &c.Title, &c.Body, &c.Source, &c.Column,
-		&c.ProgressPct, &c.ContainerID, &c.AgentRuntime, &c.WaitReason, &openQ, &c.CreatedAt, &c.UpdatedAt)
+		&c.ProgressPct, &c.ContainerID, &c.AgentRuntime, &c.WaitReason, &openQ, &c.CreatedAt, &c.UpdatedAt, &transcript)
 	if err != nil {
 		return nil, err
 	}
 	c.HasOpenQuestion = openQ == 1
+	c.Transcript = transcript
 	return c, nil
 }
 
 const cardCols = `id, board_id, title, body, source, column_name, progress_pct,
-	container_id, agent_runtime, wait_reason, has_open_question, created_at, updated_at`
+	container_id, agent_runtime, wait_reason, has_open_question, created_at, updated_at, transcript`
 
 func (d *DB) CreateCard(c *model.Card) error {
 	_, err := d.Exec(`INSERT INTO cards (id, board_id, title, body, source, column_name,
@@ -244,6 +246,14 @@ func (d *DB) SetCardOpenQuestion(id string, open bool) error {
 func (d *DB) SetCardWaitReason(id, reason string) error {
 	_, err := d.Exec(`UPDATE cards SET wait_reason = ?, updated_at = ? WHERE id = ?`,
 		reason, Now(), id)
+	return err
+}
+
+// SetCardTranscript stores the archived markdown transcript captured at
+// done-time.
+func (d *DB) SetCardTranscript(id, transcript string) error {
+	_, err := d.Exec(`UPDATE cards SET transcript = ?, updated_at = ? WHERE id = ?`,
+		transcript, Now(), id)
 	return err
 }
 

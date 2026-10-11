@@ -33,7 +33,12 @@ ingestion → inbox → working → needs_you → qa → done
 4. **QA.** Finished cards go to a separate **verifier** agent pass. It can
    approve (→ done), send the card back to working with a note, or raise its
    own question to you.
-5. **Done.** Verified work closes out.
+5. **Done.** Verified work closes out: a markdown transcript (steps, questions
+   with answers, chat, event log) is archived on the card in the database, and
+   the card's container **and** its named volume are removed — no orphaned
+   volumes. Moving a done card back to working starts it on a fresh empty
+   volume, with the archived transcript posted as a system message for
+   continuity.
 
 Out of the box Drydock ships with the `echo` demo worker and demo verifier,
 so the whole loop is exercisable with no LLM key. Real adapters implement
@@ -63,9 +68,11 @@ Register the first user (it becomes admin), and you're on the board.
 | `DRYDOCK_SECURE_COOKIE` | `false` | Set the session cookie `Secure` flag (behind TLS) |
 
 When Docker is unreachable, cards still run — the agent works without a
-container and the UI shows no container id. Stopping a card's container
-removes the container but **keeps the volume** (same lifecycle semantics as
-TermDock sessions): files persist, running processes don't.
+container and the UI shows no container id. When a card is done, its
+container **and** its named volume are removed together (the chat transcript
+lives in the database, archived on the card); the card drawer's
+"Remove container & volume" button does the same on demand with a confirm
+dialog. Reopening a done card provisions a fresh empty volume.
 
 ## API
 
