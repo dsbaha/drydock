@@ -25,6 +25,7 @@ const (
 	EvWait     = "wait"      // agent parked the card in waiting; Reason set
 	EvVerdict  = "verdict"   // verifier decision; Approved + Note set
 	EvLog      = "log"       // event-log entry only; Text set
+	EvWikiProposal = "wiki_proposal" // agent proposed a wiki edit; Wiki* fields set
 )
 
 // Event is a single agent action the Orchestrator must persist/broadcast.
@@ -37,6 +38,12 @@ type Event struct {
 	Reason   string // wait reason (EvWait)
 	Approved bool   // verdict
 	Note     string // verdict note
+	// Wiki proposal fields (EvWikiProposal). Empty WikiPageID means the
+	// proposal is for a NEW page titled WikiTitle.
+	WikiPageID   string
+	WikiTitle    string
+	WikiBody     string
+	WikiRationale string
 }
 
 // Emitter receives runtime events.
@@ -53,6 +60,10 @@ type RunContext struct {
 	Emit         Emitter
 	QuestionAsked bool // a question was already asked on this card before
 	SendBacks    int   // previous verifier send-backs (verifier context)
+	// Briefing is the run's system context: global instructions, the
+	// board's working instructions, and the board's wiki pages (capped).
+	// Runtimes must include it as system context for the agent.
+	Briefing string
 }
 
 // Runtime is a coding-agent adapter. Implementations must honor ctx

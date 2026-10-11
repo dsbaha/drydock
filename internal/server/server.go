@@ -111,8 +111,16 @@ func (s *Server) Routes() *http.ServeMux {
 	// Boards.
 	mux.Handle("GET /api/boards", authed(http.HandlerFunc(s.handleBoards)))
 	mux.Handle("POST /api/boards", authed(http.HandlerFunc(s.handleCreateBoard)))
+	mux.Handle("PUT /api/boards/{id}", authed(http.HandlerFunc(s.handleUpdateBoard)))
 	mux.Handle("GET /api/boards/{id}/cards", authed(http.HandlerFunc(s.handleBoardCards)))
 	mux.Handle("POST /api/boards/{id}/cards", authed(http.HandlerFunc(s.handleCreateCard)))
+
+	// Board wiki (reads: any user; writes: admin).
+	mux.Handle("GET /api/boards/{id}/wiki", authed(http.HandlerFunc(s.handleWikiPages)))
+	mux.Handle("POST /api/boards/{id}/wiki", authed(http.HandlerFunc(s.handleCreateWikiPage)))
+	mux.Handle("GET /api/boards/{id}/wiki/{pageID}", authed(http.HandlerFunc(s.handleWikiPage)))
+	mux.Handle("PUT /api/boards/{id}/wiki/{pageID}", authed(http.HandlerFunc(s.handleUpdateWikiPage)))
+	mux.Handle("DELETE /api/boards/{id}/wiki/{pageID}", authed(http.HandlerFunc(s.handleDeleteWikiPage)))
 
 	// Cards.
 	mux.Handle("GET /api/cards/{id}", authed(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -138,6 +146,11 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.Handle("PUT /api/admin/webhook-sources/{source}", authed(http.HandlerFunc(s.handleUpdateWebhookSource)))
 	mux.Handle("GET /api/admin/rejected", authed(http.HandlerFunc(s.handleRejected)))
 	mux.Handle("POST /api/admin/rejected/{id}/accept", authed(http.HandlerFunc(s.handleAcceptRejected)))
+	mux.Handle("GET /api/admin/wiki-proposals", authed(http.HandlerFunc(s.handleWikiProposals)))
+	mux.Handle("POST /api/admin/wiki-proposals/{id}/approve", authed(http.HandlerFunc(s.handleApproveWikiProposal)))
+	mux.Handle("POST /api/admin/wiki-proposals/{id}/reject", authed(http.HandlerFunc(s.handleRejectWikiProposal)))
+	mux.Handle("GET /api/admin/settings", authed(http.HandlerFunc(s.handleGetSettings)))
+	mux.Handle("PUT /api/admin/settings", authed(http.HandlerFunc(s.handleUpdateSettings)))
 	mux.Handle("GET /api/admin/providers", authed(http.HandlerFunc(s.handleProviders)))
 	mux.Handle("POST /api/admin/providers", authed(http.HandlerFunc(s.handleCreateProvider)))
 	mux.Handle("DELETE /api/admin/providers/{id}", authed(http.HandlerFunc(s.handleDeleteProvider)))
@@ -162,7 +175,8 @@ func (s *Server) handleBoards(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateBoard(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name string `json:"name"`
+		Name         string `json:"name"`
+		Instructions string `json:"instructions"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
@@ -173,12 +187,47 @@ func (s *Server) handleCreateBoard(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	b := &model.Board{ID: db.NewID(), Name: req.Name, CreatedAt: db.Now()}
+	b := &model.Board{ID: db.NewID(), Name: req.Name,
+		Instructions: strings.TrimSpace(req.Instructions), CreatedAt: db.Now()}
 	if err := s.DB.CreateBoard(b); err != nil {
 		writeErr(w, http.StatusInternalServerError, "database error")
 		return
 	}
 	writeJSON(w, http.StatusCreated, b)
+}
+
+// handleUpdateBoard updates a board's name and/or working instructions (admin only).
+func (s *Server) handleUpdateBoard(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	b, err := s.DB.GetBoard(r.PathValue("id"))
+	if err != nil || b == nil {
+		writeErr(w, http.StatusNotFound, "board not found")
+		return
+	}
+	var req struct {
+		Name         *string `json:"name"`
+		Instructions *string `json:"instructions"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	name := b.Name
+	if req.Name != nil && strings.TrimSpace(*req.Name) != "" {
+		name = strings.TrimSpace(*req.Name)
+	}
+	instructions := b.Instructions
+	if req.Instructions != nil {
+		instructions = strings.TrimSpace(*req.Instructions)
+	}
+	if err := s.DB.UpdateBoard(b.ID, name, instructions); err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	b.Name, b.Instructions = name, instructions
+	writeJSON(w, http.StatusOK, b)
 }
 
 func (s *Server) handleBoardCards(w http.ResponseWriter, r *http.Request) {
@@ -732,4 +781,245 @@ func (s *Server) handleCardChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// ---------- board wiki ----------
+
+// boardFromWiki resolves the board for wiki routes and 404s when missing.
+func (s *Server) boardFromWiki(w http.ResponseWriter, r *http.Request) *model.Board {
+	b, err := s.DB.GetBoard(r.PathValue("id"))
+	if err != nil || b == nil {
+		writeErr(w, http.StatusNotFound, "board not found")
+		return nil
+	}
+	return b
+}
+
+// handleWikiPages lists a board's wiki pages (any authenticated user).
+func (s *Server) handleWikiPages(w http.ResponseWriter, r *http.Request) {
+	b := s.boardFromWiki(w, r)
+	if b == nil {
+		return
+	}
+	pages, err := s.DB.ListWikiPages(b.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if pages == nil {
+		pages = []*model.WikiPage{}
+	}
+	// List view doesn't need full bodies.
+	type summary struct {
+		ID        string `json:"id"`
+		Title     string `json:"title"`
+		UpdatedAt int64  `json:"updated_at"`
+	}
+	out := make([]summary, 0, len(pages))
+	for _, p := range pages {
+		out = append(out, summary{ID: p.ID, Title: p.Title, UpdatedAt: p.UpdatedAt})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleWikiPage returns one page plus its recent revisions.
+func (s *Server) handleWikiPage(w http.ResponseWriter, r *http.Request) {
+	b := s.boardFromWiki(w, r)
+	if b == nil {
+		return
+	}
+	p, err := s.DB.GetWikiPage(r.PathValue("pageID"))
+	if err != nil || p == nil || p.BoardID != b.ID {
+		writeErr(w, http.StatusNotFound, "page not found")
+		return
+	}
+	revs, _ := s.DB.ListWikiRevisions(p.ID, 20)
+	if revs == nil {
+		revs = []*model.WikiRevision{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"page": p, "revisions": revs})
+}
+
+// handleCreateWikiPage creates a page (admin only) and records a revision.
+func (s *Server) handleCreateWikiPage(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	b := s.boardFromWiki(w, r)
+	if b == nil {
+		return
+	}
+	var req struct {
+		Title string `json:"title"`
+		Body  string `json:"body"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	req.Title = strings.TrimSpace(req.Title)
+	if req.Title == "" {
+		writeErr(w, http.StatusBadRequest, "title is required")
+		return
+	}
+	u := auth.UserFromContext(r.Context())
+	p := &model.WikiPage{ID: db.NewID(), BoardID: b.ID, Title: req.Title,
+		Body: req.Body, CreatedAt: db.Now(), UpdatedAt: db.Now()}
+	if err := s.DB.CreateWikiPage(p, "user:"+u.Username); err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	writeJSON(w, http.StatusCreated, p)
+}
+
+// handleUpdateWikiPage updates title/body (admin only); every applied edit
+// appends a revision.
+func (s *Server) handleUpdateWikiPage(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	b := s.boardFromWiki(w, r)
+	if b == nil {
+		return
+	}
+	p, err := s.DB.GetWikiPage(r.PathValue("pageID"))
+	if err != nil || p == nil || p.BoardID != b.ID {
+		writeErr(w, http.StatusNotFound, "page not found")
+		return
+	}
+	var req struct {
+		Title *string `json:"title"`
+		Body  *string `json:"body"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	title := p.Title
+	if req.Title != nil && strings.TrimSpace(*req.Title) != "" {
+		title = strings.TrimSpace(*req.Title)
+	}
+	body := p.Body
+	if req.Body != nil {
+		body = *req.Body
+	}
+	u := auth.UserFromContext(r.Context())
+	if err := s.DB.UpdateWikiPage(p.ID, title, body, "user:"+u.Username); err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	p.Title, p.Body = title, body
+	writeJSON(w, http.StatusOK, p)
+}
+
+// handleDeleteWikiPage removes a page and its history (admin only).
+func (s *Server) handleDeleteWikiPage(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	b := s.boardFromWiki(w, r)
+	if b == nil {
+		return
+	}
+	p, err := s.DB.GetWikiPage(r.PathValue("pageID"))
+	if err != nil || p == nil || p.BoardID != b.ID {
+		writeErr(w, http.StatusNotFound, "page not found")
+		return
+	}
+	if err := s.DB.DeleteWikiPage(p.ID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ---------- wiki proposals (approval queue) ----------
+
+// handleWikiProposals lists proposals, optionally filtered by ?status=.
+func (s *Server) handleWikiProposals(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	status := r.URL.Query().Get("status")
+	if status != "" && status != model.ProposalPending &&
+		status != model.ProposalApproved && status != model.ProposalRejected {
+		writeErr(w, http.StatusBadRequest, "bad status")
+		return
+	}
+	proposals, err := s.DB.ListWikiProposals(status, 100)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if proposals == nil {
+		proposals = []*model.WikiProposal{}
+	}
+	writeJSON(w, http.StatusOK, proposals)
+}
+
+// handleApproveWikiProposal applies a pending proposal (admin only).
+func (s *Server) handleApproveWikiProposal(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	p, err := s.DB.GetWikiProposal(r.PathValue("id"))
+	if err != nil || p == nil {
+		writeErr(w, http.StatusNotFound, "proposal not found")
+		return
+	}
+	editedBy := "agent:" + p.CardID
+	if p.CardID == "" {
+		editedBy = "agent:unknown"
+	}
+	page, err := s.DB.ApplyWikiProposal(p.ID, editedBy)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "cannot approve: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "page": page})
+}
+
+// handleRejectWikiProposal marks a pending proposal rejected (admin only).
+func (s *Server) handleRejectWikiProposal(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	if err := s.DB.RejectWikiProposal(r.PathValue("id")); err != nil {
+		writeErr(w, http.StatusNotFound, "proposal not found or not pending")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ---------- global settings ----------
+
+// handleGetSettings returns global settings (admin only).
+func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	instructions, _ := s.DB.GetSetting("instructions")
+	writeJSON(w, http.StatusOK, map[string]string{"instructions": instructions})
+}
+
+// handleUpdateSettings writes global settings (admin only).
+func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(s, w, r) {
+		return
+	}
+	var req struct {
+		Instructions *string `json:"instructions"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if req.Instructions != nil {
+		if err := s.DB.SetSetting("instructions", strings.TrimSpace(*req.Instructions)); err != nil {
+			writeErr(w, http.StatusInternalServerError, "database error")
+			return
+		}
+	}
+	instructions, _ := s.DB.GetSetting("instructions")
+	writeJSON(w, http.StatusOK, map[string]string{"instructions": instructions})
 }

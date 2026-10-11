@@ -20,9 +20,10 @@ const COLUMNS = [
 
 const state = {
   user: null,
-  view: "board",           // "board" | "admin"
+  view: "board",           // "board" | "admin" | "wiki"
   boards: [],
   boardId: null,
+  wikiPageId: null,       // selected wiki page
   cards: new Map(),        // id -> CardSummary
   openCardId: null,
   detail: null,            // CardDetail for openCardId
@@ -110,8 +111,10 @@ function showAuth() {
   $("auth-view").classList.remove("hidden");
   // Reset to the board view for the next login.
   $("board-view").classList.remove("hidden");
+  $("wiki-view").classList.add("hidden");
   $("admin-view").classList.add("hidden");
   $("nav-board").classList.add("active");
+  $("nav-wiki").classList.remove("active");
   $("nav-admin").classList.remove("active");
   $("nav-admin").classList.add("hidden");
   for (const id of ["board-select", "new-board-btn", "new-card-btn"]) {
@@ -159,15 +162,21 @@ async function showApp() {
 function showView(which) {
   state.view = which;
   const admin = which === "admin";
-  $("board-view").classList.toggle("hidden", admin);
+  const wiki = which === "wiki";
+  $("board-view").classList.toggle("hidden", admin || wiki);
+  $("wiki-view").classList.toggle("hidden", !wiki);
   $("admin-view").classList.toggle("hidden", !admin);
-  $("nav-board").classList.toggle("active", !admin);
+  $("nav-board").classList.toggle("active", which === "board");
+  $("nav-wiki").classList.toggle("active", wiki);
   $("nav-admin").classList.toggle("active", admin);
-  // Board controls don't apply to the admin view.
-  for (const id of ["board-select", "new-board-btn", "new-card-btn"]) {
-    $(id).classList.toggle("hidden", admin);
+  // Board controls don't apply to the admin view; the wiki view keeps the
+  // board picker (wiki is per-board) but hides the action buttons.
+  for (const id of ["new-board-btn", "new-card-btn"]) {
+    $(id).classList.toggle("hidden", admin || wiki);
   }
+  $("board-select").classList.toggle("hidden", admin);
   if (admin) loadAdmin();
+  if (wiki) loadWiki();
 }
 
 async function loadBoards() {
@@ -939,6 +948,8 @@ async function loadAdmin() {
   } catch (e) {
     if (e.message !== "unauthorized") toast("Could not load providers: " + e.message);
   }
+  await loadInstructions();
+  await loadProposals();
   await loadRejected();
 }
 
@@ -1321,6 +1332,377 @@ async function submitProvider(e) {
   }
 }
 
+/* ---------------- wiki ----------------
+   Per-board persistent wiki. Agents read pages at run start (see the run
+   briefing) and propose edits through the approval queue; admins edit
+   directly. Dependency-free markdown subset renderer below. */
+
+function escHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// md renders a small markdown subset: fenced code blocks, #/##/### headers,
+// bold, italic, inline code, links, and - / 1. ordered lists.
+function md(src) {
+  const blocks = [];
+  // Extract fenced code blocks first so their contents aren't processed.
+  let text = src.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
+    blocks.push('<pre><code>' + escHtml(code.replace(/\n$/, "")) + "</code></pre>");
+    return "\u0000" + (blocks.length - 1) + "\u0000";
+  });
+  const inline = (s) => {
+    s = escHtml(s);
+    s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return s;
+  };
+  const html = [];
+  let list = null; // "ul" | "ol" | null
+  const closeList = () => {
+    if (list) {
+      html.push(list === "ul" ? "</ul>" : "</ol>");
+      list = null;
+    }
+  };
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (/^\u0000\d+\u0000$/.test(t)) {
+      closeList();
+      html.push(blocks[parseInt(t.slice(1, -1), 10)]);
+      continue;
+    }
+    let m;
+    if ((m = t.match(/^(#{1,3})\s+(.*)/))) {
+      closeList();
+      html.push("<h" + m[1].length + ">" + inline(m[2]) + "</h" + m[1].length + ">");
+    } else if ((m = t.match(/^[-*]\s+(.*)/))) {
+      if (list !== "ul") {
+        closeList();
+        html.push("<ul>");
+        list = "ul";
+      }
+      html.push("<li>" + inline(m[1]) + "</li>");
+    } else if ((m = t.match(/^\d+\.\s+(.*)/))) {
+      if (list !== "ol") {
+        closeList();
+        html.push("<ol>");
+        list = "ol";
+      }
+      html.push("<li>" + inline(m[1]) + "</li>");
+    } else if (t === "") {
+      closeList();
+    } else {
+      closeList();
+      html.push("<p>" + inline(t) + "</p>");
+    }
+  }
+  closeList();
+  return html.join("\n");
+}
+
+function wikiBase() {
+  return "/api/boards/" + encodeURIComponent(state.boardId) + "/wiki";
+}
+
+async function loadWiki() {
+  if (!state.boardId) return;
+  state.wikiPageId = state.wikiPageId || null;
+  const isAdmin = !!(state.user && state.user.is_admin);
+  $("wiki-new-btn").classList.toggle("hidden", !isAdmin);
+  $("wiki-edit-btn").classList.toggle("hidden", !isAdmin);
+  $("wiki-delete-btn").classList.toggle("hidden", !isAdmin);
+  try {
+    const pages = (await api(wikiBase())) || [];
+    renderWikiList(pages);
+    if (state.wikiPageId) {
+      await openWikiPage(state.wikiPageId);
+    } else {
+      showWikiEmpty();
+    }
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Could not load wiki: " + e.message);
+  }
+}
+
+function renderWikiList(pages) {
+  const list = $("wiki-list");
+  list.innerHTML = "";
+  if (pages.length === 0) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "No pages yet.";
+    list.appendChild(p);
+    return;
+  }
+  for (const p of pages) {
+    const b = document.createElement("button");
+    b.className = "wiki-page-link" + (p.id === state.wikiPageId ? " active" : "");
+    b.textContent = p.title;
+    b.title = "Updated " + timeAgo(p.updated_at * 1000);
+    b.addEventListener("click", () => openWikiPage(p.id));
+    list.appendChild(b);
+  }
+}
+
+function showWikiEmpty() {
+  $("wiki-empty").classList.remove("hidden");
+  $("wiki-page").classList.add("hidden");
+}
+
+async function openWikiPage(id) {
+  state.wikiPageId = id;
+  document.querySelectorAll(".wiki-page-link").forEach((el) =>
+    el.classList.toggle("active", false)
+  );
+  try {
+    const data = await api(wikiBase() + "/" + encodeURIComponent(id));
+    renderWikiPage(data);
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Could not open page: " + e.message);
+  }
+}
+
+function renderWikiPage(data) {
+  const page = data.page;
+  const revs = data.revisions || [];
+  $("wiki-empty").classList.add("hidden");
+  $("wiki-page").classList.remove("hidden");
+  $("wiki-title").textContent = page.title;
+  $("wiki-meta").textContent =
+    "Updated " + timeAgo(page.updated_at * 1000) + " · " + revs.length + " revision" + (revs.length === 1 ? "" : "s");
+  $("wiki-body").innerHTML = md(page.body || "*Empty page.*");
+  $("wiki-body").classList.remove("hidden");
+  $("wiki-editor").classList.add("hidden");
+  $("wiki-history").classList.add("hidden");
+  $("wiki-history").innerHTML = "";
+  document.querySelectorAll(".wiki-page-link").forEach((el) => {
+    el.classList.toggle("active", el.textContent === page.title);
+  });
+  renderWikiHistory(revs);
+}
+
+function renderWikiHistory(revs) {
+  const box = $("wiki-history");
+  box.innerHTML = "";
+  const h = document.createElement("h3");
+  h.textContent = "Revision history";
+  box.appendChild(h);
+  if (revs.length === 0) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "No revisions recorded.";
+    box.appendChild(p);
+    return;
+  }
+  for (const r of revs) {
+    const wrap = document.createElement("div");
+    wrap.className = "wiki-rev";
+    const head = document.createElement("button");
+    head.className = "wiki-rev-head";
+    head.textContent = new Date(r.created_at * 1000).toLocaleString() + " · " + (r.edited_by || "unknown");
+    const body = document.createElement("div");
+    body.className = "wiki-body hidden";
+    body.innerHTML = md(r.body || "*Empty.*");
+    head.addEventListener("click", () => body.classList.toggle("hidden"));
+    wrap.append(head, body);
+    box.appendChild(wrap);
+  }
+}
+
+function startWikiEdit() {
+  const title = $("wiki-title").textContent;
+  const id = state.wikiPageId;
+  $("wiki-edit-title").value = title;
+  $("wiki-edit-body").value = "";
+  // Fetch the raw body via the page endpoint (already rendered otherwise).
+  api(wikiBase() + "/" + encodeURIComponent(id)).then((data) => {
+    $("wiki-edit-body").value = data.page.body || "";
+  });
+  $("wiki-body").classList.add("hidden");
+  $("wiki-history").classList.add("hidden");
+  $("wiki-editor").classList.remove("hidden");
+  hideError("wiki-error");
+}
+
+async function saveWikiPage() {
+  hideError("wiki-error");
+  const title = $("wiki-edit-title").value.trim();
+  const body = $("wiki-edit-body").value;
+  if (!title) {
+    showError("wiki-error", "Title is required.");
+    return;
+  }
+  try {
+    if (state.wikiPageId) {
+      const page = await api(wikiBase() + "/" + encodeURIComponent(state.wikiPageId), {
+        method: "PUT",
+        body: JSON.stringify({ title, body }),
+      });
+      state.wikiPageId = page.id;
+    } else {
+      const page = await api(wikiBase(), {
+        method: "POST",
+        body: JSON.stringify({ title, body }),
+      });
+      state.wikiPageId = page.id;
+    }
+    toast("Page saved.");
+    await loadWiki();
+  } catch (e) {
+    if (e.message !== "unauthorized") showError("wiki-error", e.message);
+  }
+}
+
+async function deleteWikiPage() {
+  if (!state.wikiPageId) return;
+  if (!confirm("Delete wiki page \"" + $("wiki-title").textContent + "\" and its history?")) return;
+  try {
+    await api(wikiBase() + "/" + encodeURIComponent(state.wikiPageId), { method: "DELETE" });
+    state.wikiPageId = null;
+    toast("Page deleted.");
+    await loadWiki();
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Delete failed: " + e.message);
+  }
+}
+
+/* ---------------- instructions (admin) ---------------- */
+
+async function loadInstructions() {
+  // Global instructions.
+  try {
+    const s = await api("/api/admin/settings");
+    $("global-instructions").value = s.instructions || "";
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Could not load settings: " + e.message);
+  }
+  // Per-board picker + editor.
+  const sel = $("instr-board");
+  sel.innerHTML = "";
+  for (const b of state.boards) {
+    const opt = document.createElement("option");
+    opt.value = b.id;
+    opt.textContent = b.name;
+    sel.appendChild(opt);
+  }
+  if (state.boardId) sel.value = state.boardId;
+  loadBoardInstructions();
+}
+
+function loadBoardInstructions() {
+  const b = state.boards.find((x) => x.id === $("instr-board").value);
+  $("board-instructions").value = (b && b.instructions) || "";
+}
+
+async function saveGlobalInstructions() {
+  hideError("instr-error");
+  try {
+    await api("/api/admin/settings", {
+      method: "PUT",
+      body: JSON.stringify({ instructions: $("global-instructions").value.trim() }),
+    });
+    toast("Global instructions saved.");
+  } catch (e) {
+    if (e.message !== "unauthorized") showError("instr-error", e.message);
+  }
+}
+
+async function saveBoardInstructions() {
+  hideError("instr-error");
+  const boardId = $("instr-board").value;
+  if (!boardId) return;
+  try {
+    const b = await api("/api/boards/" + encodeURIComponent(boardId), {
+      method: "PUT",
+      body: JSON.stringify({ instructions: $("board-instructions").value.trim() }),
+    });
+    const local = state.boards.find((x) => x.id === boardId);
+    if (local) local.instructions = b.instructions;
+    toast("Board instructions saved.");
+  } catch (e) {
+    if (e.message !== "unauthorized") showError("instr-error", e.message);
+  }
+}
+
+/* ---------------- wiki proposals queue (admin) ---------------- */
+
+async function loadProposals() {
+  try {
+    const pending = (await api("/api/admin/wiki-proposals?status=pending")) || [];
+    renderProposals(pending);
+    updateAdminBadge(pending.length);
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Could not load proposals: " + e.message);
+  }
+}
+
+function updateAdminBadge(count) {
+  const badge = $("nav-admin-badge");
+  if (count > 0) {
+    badge.textContent = count;
+    badge.classList.remove("hidden");
+  } else {
+    badge.classList.add("hidden");
+  }
+}
+
+function renderProposals(pending) {
+  const list = $("proposals-list");
+  list.innerHTML = "";
+  if (pending.length === 0) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "No pending proposals.";
+    list.appendChild(p);
+    return;
+  }
+  for (const p of pending) {
+    const wrap = document.createElement("div");
+    wrap.className = "proposal";
+    const head = document.createElement("div");
+    head.className = "admin-row-title";
+    head.textContent = (p.page_id ? "Edit: " : "New page: ") + p.title;
+    const meta = document.createElement("div");
+    meta.className = "admin-row-meta";
+    const bits = ["board: " + boardName(p.board_id), "proposed " + timeAgo(p.created_at * 1000)];
+    if (p.card_id) bits.push("card " + p.card_id.slice(0, 8));
+    meta.textContent = bits.join(" · ");
+    const rationale = document.createElement("p");
+    rationale.className = "muted";
+    rationale.textContent = p.rationale || "No rationale given.";
+    const body = document.createElement("div");
+    body.className = "wiki-body proposal-body";
+    body.innerHTML = md(p.proposed_body || "*Empty.*");
+    const actions = document.createElement("div");
+    actions.className = "admin-row";
+    const approve = document.createElement("button");
+    approve.className = "btn primary small";
+    approve.textContent = "Approve & apply";
+    approve.addEventListener("click", () => decideProposal(p.id, true));
+    const reject = document.createElement("button");
+    reject.className = "btn danger small";
+    reject.textContent = "Reject";
+    reject.addEventListener("click", () => decideProposal(p.id, false));
+    actions.append(approve, reject);
+    wrap.append(head, meta, rationale, body, actions);
+    list.appendChild(wrap);
+  }
+}
+
+async function decideProposal(id, approve) {
+  try {
+    await api("/api/admin/wiki-proposals/" + encodeURIComponent(id) + (approve ? "/approve" : "/reject"), {
+      method: "POST",
+    });
+    toast(approve ? "Proposal applied." : "Proposal rejected.");
+    loadProposals();
+  } catch (e) {
+    if (e.message !== "unauthorized") toast("Decision failed: " + e.message);
+  }
+}
+
 /* ---------------- init ---------------- */
 
 function init() {
@@ -1344,11 +1726,17 @@ function init() {
     showAuth();
   });
   $("nav-board").addEventListener("click", () => showView("board"));
+  $("nav-wiki").addEventListener("click", () => showView("wiki"));
   $("nav-admin").addEventListener("click", () => showView("admin"));
   $("board-select").addEventListener("change", (e) => {
     state.boardId = e.target.value;
     closeDrawer();
-    loadBoard();
+    if (state.view === "wiki") {
+      state.wikiPageId = null;
+      loadWiki();
+    } else {
+      loadBoard();
+    }
   });
   $("new-board-btn").addEventListener("click", createBoard);
   $("new-card-btn").addEventListener("click", openCardModal);
@@ -1396,6 +1784,36 @@ function init() {
   $("card-modal").addEventListener("click", (e) => {
     if (e.target === $("card-modal")) closeCardModal();
   });
+
+  // Wiki view.
+  $("wiki-new-btn").addEventListener("click", () => {
+    state.wikiPageId = null;
+    $("wiki-empty").classList.add("hidden");
+    $("wiki-page").classList.remove("hidden");
+    $("wiki-title").textContent = "New page";
+    $("wiki-meta").textContent = "";
+    $("wiki-body").classList.add("hidden");
+    $("wiki-history").classList.add("hidden");
+    $("wiki-edit-title").value = "";
+    $("wiki-edit-body").value = "";
+    $("wiki-editor").classList.remove("hidden");
+    hideError("wiki-error");
+  });
+  $("wiki-edit-btn").addEventListener("click", startWikiEdit);
+  $("wiki-save-btn").addEventListener("click", saveWikiPage);
+  $("wiki-cancel-btn").addEventListener("click", () => {
+    if (state.wikiPageId) openWikiPage(state.wikiPageId);
+    else showWikiEmpty();
+  });
+  $("wiki-delete-btn").addEventListener("click", deleteWikiPage);
+  $("wiki-history-btn").addEventListener("click", () => {
+    $("wiki-history").classList.toggle("hidden");
+  });
+
+  // Admin: instructions.
+  $("save-global-instructions").addEventListener("click", saveGlobalInstructions);
+  $("save-board-instructions").addEventListener("click", saveBoardInstructions);
+  $("instr-board").addEventListener("change", loadBoardInstructions);
 
   // Admin view.
   $("feed-form").addEventListener("submit", submitFeed);

@@ -166,6 +166,43 @@ func (o *Orchestrator) runtimeName(card *model.Card) string {
 	return o.DefaultRuntime
 }
 
+// wikiBriefingCap caps the total wiki text included in a run briefing.
+const wikiBriefingCap = 12 * 1024
+
+// buildBriefing assembles the run's system context: global working
+// instructions, the board's working instructions, and the board's wiki
+// pages (capped, with a truncation note). Empty sections are skipped.
+func (o *Orchestrator) buildBriefing(boardID string) string {
+	var b strings.Builder
+	if g, _ := o.DB.GetSetting("instructions"); strings.TrimSpace(g) != "" {
+		b.WriteString("# Working instructions (global)\n\n")
+		b.WriteString(strings.TrimSpace(g))
+		b.WriteString("\n\n")
+	}
+	if board, _ := o.DB.GetBoard(boardID); board != nil {
+		if in := strings.TrimSpace(board.Instructions); in != "" {
+			b.WriteString("# Working instructions for board \"" + board.Name + "\"\n\n")
+			b.WriteString(in)
+			b.WriteString("\n\n")
+		}
+	}
+	pages, _ := o.DB.ListWikiPages(boardID)
+	if len(pages) > 0 {
+		b.WriteString("# Wiki\n\n")
+		used := 0
+		for _, p := range pages {
+			entry := "## " + p.Title + "\n\n" + strings.TrimSpace(p.Body) + "\n\n"
+			if used+len(entry) > wikiBriefingCap {
+				b.WriteString("…[wiki truncated: " + itoa(len(pages)) + " pages total, briefing capped]\n")
+				break
+			}
+			b.WriteString(entry)
+			used += len(entry)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func progressOf(steps []*model.Step) int {
 	if len(steps) == 0 {
 		return 0
@@ -199,6 +236,7 @@ func (o *Orchestrator) runWorker(cardID string) {
 			ContainerID: card.ContainerID,
 			QuestionAsked: len(qs) > 0,
 			SendBacks:     sendBacks,
+			Briefing:      o.buildBriefing(card.BoardID),
 		}
 		done, err := rt.Run(ctx, rc)
 		switch {
@@ -568,6 +606,36 @@ func (o *Orchestrator) Emit(ev Event) {
 
 	case EvLog:
 		_ = o.DB.LogEvent(ev.CardID, "agent", ev.Text)
+
+	case EvWikiProposal:
+		// The agent proposed a wiki edit. It goes to the approval queue;
+		// nothing is applied until an admin approves it.
+		title := strings.TrimSpace(ev.WikiTitle)
+		body := strings.TrimSpace(ev.WikiBody)
+		if title == "" || body == "" {
+			_ = o.DB.LogEvent(ev.CardID, "wiki_proposal_rejected", "empty title or body")
+			break
+		}
+		card, _ := o.DB.GetCard(ev.CardID)
+		if card == nil {
+			break
+		}
+		p := &model.WikiProposal{
+			ID: db.NewID(), BoardID: card.BoardID, PageID: ev.WikiPageID,
+			Title: title, ProposedBody: body,
+			Rationale: strings.TrimSpace(ev.WikiRationale),
+			CardID: ev.CardID, Status: model.ProposalPending, CreatedAt: db.Now(),
+		}
+		if err := o.DB.CreateWikiProposal(p); err != nil {
+			_ = o.DB.LogEvent(ev.CardID, "wiki_proposal_rejected", "db: "+err.Error())
+			break
+		}
+		_ = o.DB.LogEvent(ev.CardID, "wiki_proposal", title)
+		_ = o.DB.AddMessage(&model.Message{ID: db.NewID(), CardID: ev.CardID,
+			From: model.FromSystem, Text: "Proposed wiki edit: \"" + title + "\" — awaiting approval.", CreatedAt: db.Now()})
+		o.Notify.NotifyChat(ev.CardID, map[string]any{"kind": "message", "from": model.FromSystem,
+			"text": "Proposed wiki edit: \"" + title + "\" — awaiting approval."})
+		o.refreshNotify(ev.CardID, "updated")
 	}
 }
 

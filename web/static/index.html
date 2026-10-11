@@ -39,7 +39,8 @@
     <span id="live-dot" class="live-dot" title="Live event stream: green = connected, amber = reconnecting"></span>
     <nav class="view-nav">
       <button id="nav-board" class="btn ghost small active">Board</button>
-      <button id="nav-admin" class="btn ghost small hidden">Admin</button>
+      <button id="nav-wiki" class="btn ghost small">Wiki</button>
+      <button id="nav-admin" class="btn ghost small hidden">Admin<span id="nav-admin-badge" class="nav-badge hidden"></span></button>
     </nav>
     <select id="board-select" title="Board"></select>
     <button id="new-board-btn" class="btn ghost small">+ Board</button>
@@ -51,6 +52,29 @@
 
   <div id="admin-view" class="admin-view hidden">
     <div class="admin-wrap">
+      <section class="admin-section">
+        <h2>Instructions</h2>
+        <p class="muted">Working instructions injected into every agent run as system context — global first, then the board's own.</p>
+        <h3>Global instructions</h3>
+        <textarea id="global-instructions" rows="4" placeholder="How agents should work everywhere, e.g.: never invent behavior in code; always cite measurements…"></textarea>
+        <div class="admin-row">
+          <button id="save-global-instructions" class="btn primary small">Save global instructions</button>
+        </div>
+        <h3>Per-board instructions</h3>
+        <div class="admin-form">
+          <select id="instr-board" title="Board"></select>
+          <textarea id="board-instructions" rows="4" placeholder="Working agreements for this board…"></textarea>
+          <div class="admin-row">
+            <button id="save-board-instructions" class="btn primary small">Save board instructions</button>
+          </div>
+        </div>
+        <p id="instr-error" class="error hidden"></p>
+      </section>
+      <section class="admin-section">
+        <h2>Wiki proposals</h2>
+        <p class="muted">Agent-proposed wiki edits awaiting your approval. Approving applies the edit and records a revision; rejecting discards it.</p>
+        <div id="proposals-list"></div>
+      </section>
       <section class="admin-section">
         <h2>RSS sources</h2>
         <p class="muted">Feeds are polled on their interval; each new item becomes a card in the feed's board and auto-starts — unless LLM intake filtering is enabled for the feed, in which case only accepted items become cards.</p>
@@ -102,6 +126,44 @@
         <div id="rejected-list"></div>
       </section>
     </div>
+  </div>
+
+  <div class="layout hidden" id="wiki-view">
+    <aside class="wiki-side">
+      <div class="wiki-side-head">
+        <span class="drawer-label">Pages</span>
+        <div class="spacer"></div>
+        <button id="wiki-new-btn" class="btn ghost small hidden">+ Page</button>
+      </div>
+      <div id="wiki-list"></div>
+    </aside>
+    <main class="wiki-main">
+      <div id="wiki-empty" class="empty-state">
+        <h2>No page selected</h2>
+        <p>Pick a page on the left, or create one.</p>
+      </div>
+      <article id="wiki-page" class="hidden">
+        <div class="wiki-page-head">
+          <h2 id="wiki-title"></h2>
+          <div class="spacer"></div>
+          <button id="wiki-edit-btn" class="btn small hidden">Edit</button>
+          <button id="wiki-history-btn" class="btn small">History</button>
+          <button id="wiki-delete-btn" class="btn danger small hidden">Delete</button>
+        </div>
+        <p id="wiki-meta" class="muted"></p>
+        <div id="wiki-body" class="wiki-body"></div>
+        <div id="wiki-editor" class="hidden">
+          <input id="wiki-edit-title" type="text" maxlength="120" placeholder="Page title">
+          <textarea id="wiki-edit-body" rows="18" placeholder="Markdown…"></textarea>
+          <div class="admin-row">
+            <button id="wiki-save-btn" class="btn primary small">Save</button>
+            <button id="wiki-cancel-btn" class="btn small">Cancel</button>
+          </div>
+          <p id="wiki-error" class="error hidden"></p>
+        </div>
+        <div id="wiki-history" class="hidden"></div>
+      </article>
+    </main>
   </div>
 
   <div class="layout" id="board-view">

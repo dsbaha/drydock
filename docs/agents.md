@@ -22,7 +22,11 @@ type Runtime interface {
 `RunContext` carries the card, its step plan (`Steps`), the card's container
 ID (`ContainerID`, empty when Docker is unreachable), whether a question was
 already asked (`QuestionAsked` — don't ask twice), and an `Emit` sink for
-events.
+events. `Briefing` carries the run's system context — global working
+instructions, the board's working instructions, and the board's wiki pages
+(capped at ~12KB) — **include it as system context** when you prompt the
+model, so every run works from the user's instructions and accumulated
+knowledge.
 
 ## Events (the only way a runtime talks back)
 
@@ -34,9 +38,20 @@ events.
 | `wait`       | `Reason`                        | Parks the card in the `waiting` column with the reason; the run is stopped |
 | `verdict`    | `Approved`, `Note`              | Verifier only: approve → `done`; reject → back to `working` with the note |
 | `log`        | `Text`                          | Appends to the card's event log                               |
+| `wiki_proposal` | `WikiPageID` ("" = new page), `WikiTitle`, `WikiBody`, `WikiRationale` | Queues a wiki edit for admin approval; nothing is applied until approved |
 
 Emit them via `rc.Emit.Emit(agents.Event{Kind: agents.EvMessage, ...})` — the
 orchestrator fills in `CardID`.
+
+## Proposing wiki edits
+
+When your run learns something durable — an environment quirk, a corrected
+procedure, a decision worth remembering — emit `EvWikiProposal`. Set
+`WikiPageID` to update an existing page (it was in your briefing) or leave it
+empty with a `WikiTitle` to propose a new page. The proposal lands in the
+admin approval queue; an admin applies or rejects it, and every applied edit
+is recorded as a wiki revision with your card ID as attribution. Propose
+edits sparingly: durable knowledge, not run chatter.
 
 ## Writing a pi adapter (sketch)
 

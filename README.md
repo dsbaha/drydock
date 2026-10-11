@@ -76,7 +76,10 @@ dialog. Reopening a done card provisions a fresh empty volume.
 
 ## API
 
-Boards: `GET/POST /api/boards`, `GET/POST /api/boards/:id/cards`
+Boards: `GET/POST /api/boards`, `PUT /api/boards/:id` (admin),
+`GET/POST /api/boards/:id/cards`
+Wiki: `GET/POST /api/boards/:id/wiki`, `GET/PUT/DELETE /api/boards/:id/wiki/:pageID`
+(cRUD admin-only for writes)
 Cards: `GET /api/cards/:id`, `POST /api/cards/:id/messages`,
 `POST /api/cards/:id/answer`, `POST /api/cards/:id/move`,
 `POST /api/cards/:id/sendback`, `POST /api/cards/:id/stop`
@@ -84,7 +87,9 @@ Ingest: `POST /api/ingest/webhook/:source`
 Admin: `GET/POST/DELETE /api/admin/feeds`, `PUT /api/admin/feeds/:id`,
 `GET /api/admin/webhook-sources`, `PUT /api/admin/webhook-sources/:source`,
 `GET /api/admin/rejected`, `POST /api/admin/rejected/:id/accept`,
-`GET/POST/DELETE /api/admin/providers`
+`GET/POST/DELETE /api/admin/providers`,
+`GET /api/admin/wiki-proposals?status=`, `POST /api/admin/wiki-proposals/:id/approve|reject`,
+`GET/PUT /api/admin/settings`
 Live: `GET /api/stream` (board events), `GET /api/cards/:id/chat` (per-card chat)
 
 ## Design decisions
@@ -114,6 +119,14 @@ Live: `GET /api/stream` (board events), `GET /api/cards/:id/chat` (per-card chat
   call through the same reverse proxy that enforces auth.
 - **Single static binary**, `go:embed` UI, SQLite (WAL), no CGO — same
   deployment story as TermDock.
+- **Instructions layer.** Global working instructions plus per-board
+  instructions are injected into every worker run as system context
+  (`RunContext.Briefing`), so agents work the way the user asked.
+- **Persistent per-board wikis.** Markdown pages agents read at run start
+  (capped ~12KB in the briefing). Agents propose edits via a `wiki_proposal`
+  event; proposals sit in an admin **approval queue** — nothing applies
+  without approval, and every applied edit (user or approved agent) is kept
+  as a revision with `user:<name>` / `agent:<card_id>` attribution.
 
 ## Build notes
 

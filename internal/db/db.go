@@ -148,11 +148,50 @@ func (d *DB) migrate() error {
 			created_at INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_rejected_created ON rejected_items(created_at)`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS wiki_pages (
+			id TEXT PRIMARY KEY,
+			board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+			title TEXT NOT NULL,
+			body TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_wiki_pages_board ON wiki_pages(board_id)`,
+		`CREATE TABLE IF NOT EXISTS wiki_revisions (
+			id TEXT PRIMARY KEY,
+			page_id TEXT NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+			body TEXT NOT NULL DEFAULT '',
+			edited_by TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_wiki_revisions_page ON wiki_revisions(page_id)`,
+		`CREATE TABLE IF NOT EXISTS wiki_proposals (
+			id TEXT PRIMARY KEY,
+			board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+			page_id TEXT NOT NULL DEFAULT '',
+			title TEXT NOT NULL,
+			proposed_body TEXT NOT NULL DEFAULT '',
+			rationale TEXT NOT NULL DEFAULT '',
+			card_id TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending',
+			created_at INTEGER NOT NULL,
+			decided_at INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_wiki_proposals_status ON wiki_proposals(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_wiki_proposals_board ON wiki_proposals(board_id)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.Exec(s); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
+	}
+	// Seed the global settings row.
+	if _, err := d.Exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('instructions', '')`); err != nil {
+		return fmt.Errorf("migrate: seed settings: %w", err)
 	}
 	// Additive migrations for databases created before these columns
 	// existed. Idempotent: skipped when the column is already present.
@@ -169,6 +208,9 @@ func (d *DB) migrate() error {
 		return err
 	}
 	if err := d.ensureColumn("cards", "transcript", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("boards", "instructions", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil

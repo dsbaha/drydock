@@ -75,13 +75,13 @@ func (d *DB) DeleteAuthSession(token string) error {
 // ---------- boards ----------
 
 func (d *DB) CreateBoard(b *model.Board) error {
-	_, err := d.Exec(`INSERT INTO boards (id, name, created_at) VALUES (?, ?, ?)`,
-		b.ID, b.Name, b.CreatedAt)
+	_, err := d.Exec(`INSERT INTO boards (id, name, instructions, created_at) VALUES (?, ?, ?, ?)`,
+		b.ID, b.Name, b.Instructions, b.CreatedAt)
 	return err
 }
 
 func (d *DB) ListBoards() ([]*model.Board, error) {
-	rows, err := d.Query(`SELECT id, name, created_at FROM boards ORDER BY created_at`)
+	rows, err := d.Query(`SELECT id, name, instructions, created_at FROM boards ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +89,7 @@ func (d *DB) ListBoards() ([]*model.Board, error) {
 	var out []*model.Board
 	for rows.Next() {
 		b := &model.Board{}
-		if err := rows.Scan(&b.ID, &b.Name, &b.CreatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.Name, &b.Instructions, &b.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -99,12 +99,18 @@ func (d *DB) ListBoards() ([]*model.Board, error) {
 
 func (d *DB) GetBoard(id string) (*model.Board, error) {
 	b := &model.Board{}
-	err := d.QueryRow(`SELECT id, name, created_at FROM boards WHERE id = ?`, id).
-		Scan(&b.ID, &b.Name, &b.CreatedAt)
+	err := d.QueryRow(`SELECT id, name, instructions, created_at FROM boards WHERE id = ?`, id).
+		Scan(&b.ID, &b.Name, &b.Instructions, &b.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	return b, err
+}
+
+// UpdateBoard sets a board's name and working instructions.
+func (d *DB) UpdateBoard(id, name, instructions string) error {
+	_, err := d.Exec(`UPDATE boards SET name = ?, instructions = ? WHERE id = ?`, name, instructions, id)
+	return err
 }
 
 // EnsureDefaultBoard creates the "Main" board when none exists.
@@ -690,4 +696,226 @@ func (d *DB) CountEvents(cardID, kind string) (int, error) {
 	var n int
 	err := d.QueryRow(`SELECT COUNT(*) FROM events WHERE card_id = ? AND kind = ?`, cardID, kind).Scan(&n)
 	return n, err
+}
+
+// ---------- settings ----------
+
+// GetSetting reads a global setting ("" when unset).
+func (d *DB) GetSetting(key string) (string, error) {
+	var v string
+	err := d.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
+}
+
+// SetSetting writes a global setting.
+func (d *DB) SetSetting(key, value string) error {
+	_, err := d.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
+
+// ---------- wiki pages ----------
+
+// CreateWikiPage inserts a page and records its initial revision.
+func (d *DB) CreateWikiPage(p *model.WikiPage, editedBy string) error {
+	if _, err := d.Exec(`INSERT INTO wiki_pages (id, board_id, title, body, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		p.ID, p.BoardID, p.Title, p.Body, p.CreatedAt, p.UpdatedAt); err != nil {
+		return err
+	}
+	return d.AddWikiRevision(p.ID, p.Body, editedBy)
+}
+
+// ListWikiPages returns a board's pages ordered by title.
+func (d *DB) ListWikiPages(boardID string) ([]*model.WikiPage, error) {
+	rows, err := d.Query(`SELECT id, board_id, title, body, created_at, updated_at
+		FROM wiki_pages WHERE board_id = ? ORDER BY title`, boardID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.WikiPage
+	for rows.Next() {
+		p := &model.WikiPage{}
+		if err := rows.Scan(&p.ID, &p.BoardID, &p.Title, &p.Body, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// GetWikiPage fetches one page.
+func (d *DB) GetWikiPage(id string) (*model.WikiPage, error) {
+	p := &model.WikiPage{}
+	err := d.QueryRow(`SELECT id, board_id, title, body, created_at, updated_at
+		FROM wiki_pages WHERE id = ?`, id).
+		Scan(&p.ID, &p.BoardID, &p.Title, &p.Body, &p.CreatedAt, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return p, err
+}
+
+// UpdateWikiPage sets title/body and records a revision. editedBy is
+// "user:<username>" for direct edits or "agent:<card_id>" for approvals.
+func (d *DB) UpdateWikiPage(id, title, body, editedBy string) error {
+	if _, err := d.Exec(`UPDATE wiki_pages SET title = ?, body = ?, updated_at = ? WHERE id = ?`,
+		title, body, Now(), id); err != nil {
+		return err
+	}
+	return d.AddWikiRevision(id, body, editedBy)
+}
+
+// DeleteWikiPage removes a page; revisions and proposals cascade.
+func (d *DB) DeleteWikiPage(id string) error {
+	_, err := d.Exec(`DELETE FROM wiki_pages WHERE id = ?`, id)
+	return err
+}
+
+// AddWikiRevision appends a revision row.
+func (d *DB) AddWikiRevision(pageID, body, editedBy string) error {
+	_, err := d.Exec(`INSERT INTO wiki_revisions (id, page_id, body, edited_by, created_at)
+		VALUES (?, ?, ?, ?, ?)`, NewID(), pageID, body, editedBy, Now())
+	return err
+}
+
+// ListWikiRevisions returns a page's revisions newest-first.
+func (d *DB) ListWikiRevisions(pageID string, limit int) ([]*model.WikiRevision, error) {
+	rows, err := d.Query(`SELECT id, page_id, body, edited_by, created_at
+		FROM wiki_revisions WHERE page_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`, pageID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.WikiRevision
+	for rows.Next() {
+		r := &model.WikiRevision{}
+		if err := rows.Scan(&r.ID, &r.PageID, &r.Body, &r.EditedBy, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ---------- wiki proposals ----------
+
+// CreateWikiProposal queues an agent-proposed wiki edit for admin approval.
+func (d *DB) CreateWikiProposal(p *model.WikiProposal) error {
+	_, err := d.Exec(`INSERT INTO wiki_proposals
+		(id, board_id, page_id, title, proposed_body, rationale, card_id, status, created_at, decided_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.BoardID, p.PageID, p.Title, p.ProposedBody, p.Rationale, p.CardID,
+		p.Status, p.CreatedAt, p.DecidedAt)
+	return err
+}
+
+// ListWikiProposals returns proposals, optionally filtered by status, newest first.
+func (d *DB) ListWikiProposals(status string, limit int) ([]*model.WikiProposal, error) {
+	q := `SELECT id, board_id, page_id, title, proposed_body, rationale, card_id, status, created_at, decided_at
+		FROM wiki_proposals`
+	var args []any
+	if status != "" {
+		q += ` WHERE status = ?`
+		args = append(args, status)
+	}
+	q += ` ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := d.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.WikiProposal
+	for rows.Next() {
+		p := &model.WikiProposal{}
+		if err := rows.Scan(&p.ID, &p.BoardID, &p.PageID, &p.Title, &p.ProposedBody,
+			&p.Rationale, &p.CardID, &p.Status, &p.CreatedAt, &p.DecidedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// GetWikiProposal fetches one proposal.
+func (d *DB) GetWikiProposal(id string) (*model.WikiProposal, error) {
+	p := &model.WikiProposal{}
+	err := d.QueryRow(`SELECT id, board_id, page_id, title, proposed_body, rationale, card_id,
+		status, created_at, decided_at FROM wiki_proposals WHERE id = ?`, id).
+		Scan(&p.ID, &p.BoardID, &p.PageID, &p.Title, &p.ProposedBody,
+			&p.Rationale, &p.CardID, &p.Status, &p.CreatedAt, &p.DecidedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return p, err
+}
+
+// CountPendingWikiProposals counts proposals awaiting a decision.
+func (d *DB) CountPendingWikiProposals() (int, error) {
+	var n int
+	err := d.QueryRow(`SELECT COUNT(*) FROM wiki_proposals WHERE status = ?`, model.ProposalPending).Scan(&n)
+	return n, err
+}
+
+// RejectWikiProposal marks a pending proposal rejected.
+func (d *DB) RejectWikiProposal(id string) error {
+	res, err := d.Exec(`UPDATE wiki_proposals SET status = ?, decided_at = ?
+		WHERE id = ? AND status = ?`, model.ProposalRejected, Now(), id, model.ProposalPending)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ApplyWikiProposal applies an approved proposal: for a new-page proposal it
+// creates the page; otherwise it replaces the page body. Either way a
+// revision is recorded with editedBy ("agent:<card_id>"). The proposal is
+// marked approved. Only pending proposals can be applied.
+func (d *DB) ApplyWikiProposal(id, editedBy string) (*model.WikiPage, error) {
+	p, err := d.GetWikiProposal(id)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, sql.ErrNoRows
+	}
+	if p.Status != model.ProposalPending {
+		return nil, fmt.Errorf("proposal is not pending")
+	}
+	var page *model.WikiPage
+	if p.PageID == "" {
+		page = &model.WikiPage{
+			ID: NewID(), BoardID: p.BoardID, Title: p.Title,
+			Body: p.ProposedBody, CreatedAt: Now(), UpdatedAt: Now(),
+		}
+		if err := d.CreateWikiPage(page, editedBy); err != nil {
+			return nil, err
+		}
+	} else {
+		page, err = d.GetWikiPage(p.PageID)
+		if err != nil {
+			return nil, err
+		}
+		if page == nil {
+			return nil, fmt.Errorf("proposal target page not found")
+		}
+		if err := d.UpdateWikiPage(page.ID, page.Title, p.ProposedBody, editedBy); err != nil {
+			return nil, err
+		}
+		page.Body = p.ProposedBody
+	}
+	if _, err := d.Exec(`UPDATE wiki_proposals SET status = ?, decided_at = ? WHERE id = ?`,
+		model.ProposalApproved, Now(), id); err != nil {
+		return nil, err
+	}
+	return page, nil
 }

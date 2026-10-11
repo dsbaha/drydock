@@ -39,9 +39,10 @@ const (
 
 // Board is a kanban board. Columns are fixed pipeline stages, not rows.
 type Board struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	CreatedAt int64  `json:"created_at"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Instructions string `json:"instructions"` // per-board working instructions for agents
+	CreatedAt    int64  `json:"created_at"`
 }
 
 // Card is a unit of agentic work on the board.
@@ -162,6 +163,50 @@ type User struct {
 	PasswordHash string `json:"-"`
 	IsAdmin      bool   `json:"is_admin"`
 	CreatedAt    int64  `json:"created_at"`
+}
+
+// WikiPage is one page of a board's persistent wiki: knowledge agents read
+// at run start and can propose edits to (via the approval queue).
+type WikiPage struct {
+	ID        string `json:"id"`
+	BoardID   string `json:"board_id"`
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+// WikiRevision is one applied version of a wiki page. Appended on every
+// applied edit (user edits and approved agent proposals alike) so history
+// is never lost.
+type WikiRevision struct {
+	ID        string `json:"id"`
+	PageID    string `json:"page_id"`
+	Body      string `json:"body"`
+	EditedBy  string `json:"edited_by"` // "user:<username>" or "agent:<card_id>"
+	CreatedAt int64  `json:"created_at"`
+}
+
+// Wiki proposal statuses.
+const (
+	ProposalPending  = "pending"
+	ProposalApproved = "approved"
+	ProposalRejected = "rejected"
+)
+
+// WikiProposal is an agent-proposed wiki edit awaiting admin approval.
+// PageID empty means a proposal for a NEW page titled Title.
+type WikiProposal struct {
+	ID          string `json:"id"`
+	BoardID     string `json:"board_id"`
+	PageID      string `json:"page_id"` // "" → new page
+	Title       string `json:"title"`
+	ProposedBody string `json:"proposed_body"`
+	Rationale   string `json:"rationale"`
+	CardID      string `json:"card_id"` // proposing run ("" when unknown)
+	Status      string `json:"status"`  // pending | approved | rejected
+	CreatedAt   int64  `json:"created_at"`
+	DecidedAt   int64  `json:"decided_at"`
 }
 
 // AuthSession is a login session (cookie token).
